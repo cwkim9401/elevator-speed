@@ -59,7 +59,7 @@
   <div id="banner" class="banner"></div>
 
   <div class="card">
-    <div id="status" class="status">버튼을 누른 뒤 <b>2초간 정지 상태</b>를 유지하세요.</div>
+    <div id="status" class="status">버튼을 누른 뒤 <b>3초간 정지 상태</b>를 유지하세요.</div>
     <div id="liveWrap" class="live" style="display:none">
       <div><span id="liveVal" class="big">0.0</span></div>
       <div class="unit">m/min (실시간)</div>
@@ -81,6 +81,10 @@
       <div class="label">정격속도 추정 (정속 구간)</div>
       <div><span id="cruiseMpm" class="val">–</span><span class="sub"> m/min</span></div>
       <div class="sub"><span id="cruiseMs">–</span> m/s</div>
+    </div>
+    <div id="calWrap" class="hero" style="display:none; padding-top:0">
+      <div class="label">거리보정 정격속도 (실제거리 입력 시)</div>
+      <div><span id="calMpm" class="val">–</span><span class="sub"> m/min</span></div>
     </div>
     <div class="grid">
       <div class="stat"><div class="k">최고속도</div><div id="maxMpm" class="v">–</div></div>
@@ -106,20 +110,28 @@
   </div>
 
   <div class="card note">
-    사용법: ① <b>정지 상태</b>에서 시작 → 2초 기준 측정 → ② 화면 안내가 뜨면 엘리베이터 운행
-    (정속 구간 확보를 위해 3~4개 층 이상 권장) → ③ <b>완전히 멈춘 뒤</b> 종료.
+    사용법: ① <b>정지 상태</b>에서 시작 → 3초 카운트다운(움직이면 다시 셈) → ② 안내가 뜨면 엘리베이터 운행
+    (정속 구간 확보를 위해 3~4개 층 이상 권장) → ③ 도착 후 <b>3초간 멈추면 자동 종료</b>됩니다.
     가속도계 적분 방식의 <b>현장 참고용</b>이며, 공단 정식 검사(회전속도계·엔코더)를 대체하지 않습니다.
+    실제 이동거리를 입력하면 <b>거리보정 정격속도</b>가 함께 표시됩니다.
     최초 1회 온라인 접속하면 이후 <b>오프라인</b>에서도 동작합니다.
   </div>
 
 <script>
 (function(){
   "use strict";
-  var BASELINE_MS = 2000, SMOOTH_WIN = 5, PLATEAU_FRAC = 0.8;
+  var BASELINE_MS = 3000, SMOOTH_WIN = 5, PLATEAU_FRAC = 0.8;
+  // 드리프트 방지: ACC_GATE(m/s^2) 미만 가속도는 0으로 취급(데드존).
+  // 무가속이면서 속도가 V_FLOOR(m/s, 엘리베이터 최저속도 0.25 미만) 미만이면 0으로 클램프.
+  var ACC_GATE = 0.10, V_FLOOR = 0.15;
+  // 자동 종료: 운행(속도>MOVED_TH)을 마친 뒤 정지(속도<STILL_V)가 STOP_HOLD_MS 지속되면 종료.
+  // 기준 카운트다운 중 |가속도|가 MOVE_RESET_TH 넘게 변하면 움직임으로 보고 카운트 리셋.
+  var STOP_HOLD_MS = 3000, MOVE_RESET_TH = 0.6, MOVED_TH = 0.30, STILL_V = 0.20;
 
   var recording = false, phase = "idle";
   var samples = [], baselineSamples = [], baseline = null;
   var recordStart = 0, vLive = 0, lastLive = null, ticker = null, history = [];
+  var stillSince = null, hasMoved = false, baseMag = null;
 
   var $ = function(id){ return document.getElementById(id); };
   var btn = $("btn");
@@ -167,14 +179,22 @@
     smooth(av, SMOOTH_WIN);
 
     var vel = [{t:av[0].t, v:0}], v=0, i, dt;
+    var aPrev = Math.abs(av[0].a) < ACC_GATE ? 0 : av[0].a;
+    var dz = [aPrev];   // 데드존 적용 가속도 (정지 클램프 판정용)
     for(i=1;i<av.length;i++){
+      var a = Math.abs(av[i].a) < ACC_GATE ? 0 : av[i].a;   // 가속도 데드존
       dt = av[i].t - av[i-1].t;
-      v += (av[i].a + av[i-1].a)/2 * dt;
+      v += (a + aPrev)/2 * dt;
       vel.push({t:av[i].t, v:v});
+      dz.push(a);
+      aPrev = a;
     }
+    // 잔류 바이어스 보정: 출발·도착 v=0 -> 끝값을 0으로 선형 보정
     var vEnd = vel[vel.length-1].v, tS = vel[0].t, tE = vel[vel.length-1].t;
     var span = (tE - tS) || 1;
     for(i=0;i<vel.length;i++) vel[i].v -= vEnd * (vel[i].t - tS)/span;
+    // 정지 클램프: 무가속 & 최저속도 미만이면 0 (드리프트 잔재 제거)
+    for(i=0;i<vel.length;i++){ if(dz[i] === 0 && Math.abs(vel[i].v) < V_FLOOR) vel[i].v = 0; }
 
     var absV = vel.map(function(p){ return Math.abs(p.v); });
     var maxV = Math.max.apply(null, absV.concat([0]));
@@ -200,29 +220,49 @@
     var elapsed = t - recordStart;
 
     if(phase === "baseline"){
+      var mag = Math.hypot(s.x, s.y, s.z);
+      if(baseMag !== null && Math.abs(mag - baseMag) > MOVE_RESET_TH){
+        // 카운트다운 중 움직임 감지 → 기준 측정을 처음부터 다시
+        recordStart = t; samples = [s]; baselineSamples = []; baseMag = mag;
+        return;
+      }
+      baseMag = (baseMag === null) ? mag : baseMag*0.9 + mag*0.1;
       baselineSamples.push(s);
       if(elapsed >= BASELINE_MS){
         baseline = computeBaseline(baselineSamples);
         phase = "ride";
-        vLive = 0;
-        lastLive = { t:t, aVert: vertAccel(baseline, s) };
+        vLive = 0; hasMoved = false; stillSince = null;
+        var a0 = vertAccel(baseline, s);
+        lastLive = { t:t, aVert: Math.abs(a0) < ACC_GATE ? 0 : a0 };
         $("countdown").style.display = "none";
         $("liveWrap").style.display = "block";
-        $("status").innerHTML = "<b>지금 엘리베이터를 운행하세요</b> — 멈춘 뒤 종료를 누르세요";
+        $("status").innerHTML = "<b>지금 엘리베이터를 운행하세요</b> — 멈추면 <b>자동 종료</b>됩니다";
       }
     } else if(phase === "ride"){
-      var aVert = vertAccel(baseline, s);
+      var aRaw = vertAccel(baseline, s);
+      var aVert = Math.abs(aRaw) < ACC_GATE ? 0 : aRaw;       // 가속도 데드존
       if(lastLive){
         var dt = (t - lastLive.t)/1000;
         vLive += (aVert + lastLive.aVert)/2 * dt;
       }
+      if(aVert === 0 && Math.abs(vLive) < V_FLOOR) vLive = 0; // 정지 클램프
       lastLive = { t:t, aVert:aVert };
+      if(Math.abs(vLive) > MOVED_TH) hasMoved = true;
+      // 운행을 마치고 다시 정지 상태가 STOP_HOLD_MS 지속되면 자동 종료
+      var stationary = (aVert === 0 && Math.abs(vLive) < STILL_V);
+      if(hasMoved && stationary){
+        if(stillSince === null) stillSince = t;
+        else if(t - stillSince >= STOP_HOLD_MS){ finishMeasurement(true); return; }
+      } else {
+        stillSince = null;
+      }
     }
   }
 
   function uiTick(){
     if(!recording) return;
-    var elapsed = performance.now() - recordStart;
+    var now = performance.now();
+    var elapsed = now - recordStart;
     if(phase === "baseline"){
       var left = Math.ceil((BASELINE_MS - elapsed)/1000);
       $("countdown").style.display = "block";
@@ -230,6 +270,12 @@
       $("status").textContent = "기준 측정 중… 정지 상태를 유지하세요";
     } else if(phase === "ride"){
       $("liveVal").textContent = (Math.abs(vLive)*60).toFixed(1);
+      if(hasMoved && stillSince !== null){
+        var rem = Math.ceil((STOP_HOLD_MS - (now - stillSince))/1000);
+        $("status").innerHTML = "정지 감지 — <b>" + (rem>0?rem:1) + "초</b> 후 자동 종료";
+      } else if(hasMoved){
+        $("status").innerHTML = "운행 중… 도착 후 멈추면 <b>자동 종료</b>됩니다";
+      }
     }
   }
 
@@ -238,9 +284,11 @@
       recording = true; phase = "baseline";
       samples = []; baselineSamples = []; baseline = null;
       vLive = 0; lastLive = null; recordStart = performance.now();
+      baseMag = null; stillSince = null; hasMoved = false;
       $("results").classList.remove("show");
       $("liveWrap").style.display = "none";
       $("countdown").style.display = "block";
+      $("status").innerHTML = "기준 측정 중… <b>정지 상태</b>를 유지하세요";
       btn.textContent = "측정 종료"; btn.classList.add("stop");
       window.addEventListener("devicemotion", onMotion);
       ticker = setInterval(uiTick, 100);
@@ -256,7 +304,8 @@
     }
   }
 
-  function stop(){
+  function finishMeasurement(auto){
+    if(!recording) return;
     recording = false;
     window.removeEventListener("devicemotion", onMotion);
     if(ticker){ clearInterval(ticker); ticker = null; }
@@ -266,17 +315,18 @@
     $("liveWrap").style.display = "none";
 
     if(samples.length < 10 || (samples[samples.length-1].t - recordStart) < BASELINE_MS + 1000){
-      $("status").innerHTML = "측정 시간이 너무 짧습니다. 다시 시도하세요 (기준 2초 + 운행 필요).";
+      $("status").innerHTML = "측정 시간이 너무 짧습니다. 다시 시도하세요 (기준 3초 + 운행 필요).";
       return;
     }
     var r = process(samples);
     showResults(r);
     pushHistory(r);
-    $("status").innerHTML = "측정 완료. 결과를 확인하세요.";
+    $("status").innerHTML = auto ? "정지 감지 — <b>자동 종료</b>되었습니다. 결과를 확인하세요."
+                                 : "측정 완료. 결과를 확인하세요.";
   }
 
   btn.addEventListener("click", function(){
-    if(recording) stop(); else start();
+    if(recording) finishMeasurement(false); else start();
   });
 
   function showResults(r){
@@ -293,8 +343,12 @@
       var errp = (r.dist - known)/known*100;
       $("err").textContent = (errp>=0?"+":"") + errp.toFixed(1) + " %";
       $("errStat").style.display = "block";
+      var calMs = r.dist > 0 ? r.cruise * (known / r.dist) : r.cruise;
+      $("calMpm").textContent = (calMs*60).toFixed(1);
+      $("calWrap").style.display = "block";
     } else {
       $("errStat").style.display = "none";
+      $("calWrap").style.display = "none";
     }
     $("results").classList.add("show");
     drawChart(r.vel);
