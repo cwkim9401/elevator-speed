@@ -42,13 +42,14 @@
   .stat .k { font-size:12px; color:var(--muted); }
   .stat .v { font-size:20px; font-weight:700; margin-top:2px; }
   .stat .v.err { color:var(--danger); }
-  canvas { width:100%; height:auto; background:#11151c; border:1px solid var(--line); border-radius:10px; margin-top:10px; }
+  canvas { width:100%; height:auto; background:#11151c; border:1px solid var(--line); border-radius:10px; margin-top:10px; touch-action:none; }
   .hist { font-size:13px; }
   .hist table { width:100%; border-collapse:collapse; }
   .hist th, .hist td { padding:6px 4px; border-bottom:1px solid var(--line); text-align:right; }
   .hist th:first-child, .hist td:first-child { text-align:left; }
   .row { display:flex; gap:8px; }
   button.sec { flex:1; font-size:14px; padding:10px; border-radius:9px; border:1px solid var(--line); background:#11151c; color:var(--txt); }
+  button.sec.active { border-color:var(--accent); color:var(--accent); }
   button.install { width:100%; margin-top:10px; font-size:16px; font-weight:700; padding:14px; border-radius:11px; border:1px solid var(--accent); background:transparent; color:var(--accent); display:none; }
   .note { font-size:12px; color:var(--muted); line-height:1.5; }
 </style>
@@ -86,6 +87,11 @@
       <div class="stat"><div class="k">기준 중력</div><div id="gmag" class="v">–</div></div>
     </div>
     <canvas id="chart" width="600" height="240"></canvas>
+    <div id="chartInfo" class="note" style="margin-top:6px; min-height:18px"></div>
+    <div class="row" style="margin-top:8px">
+      <button id="preciseBtn" class="sec">정밀 확인</button>
+      <button id="chartReset" class="sec" style="display:none; flex:0 0 auto">화면 리셋</button>
+    </div>
   </div>
 
   <div id="histCard" class="card hist" style="display:none">
@@ -335,31 +341,161 @@
     drawChart(r.vel);
   }
 
-  function drawChart(vel){
-    var cv = $("chart"), ctx = cv.getContext("2d");
-    var W = cv.width, H = cv.height, pad = 34;
-    ctx.clearRect(0,0,W,H);
-    if(vel.length < 2) return;
-    var tMax = vel[vel.length-1].t || 1;
-    var vMax = 1, i;
-    for(i=0;i<vel.length;i++){ var m=Math.abs(vel[i].v)*60; if(m>vMax) vMax=m; }
-    vMax *= 1.15;
-    ctx.strokeStyle = "#2b323f"; ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.moveTo(pad,5); ctx.lineTo(pad,H-pad); ctx.lineTo(W-5,H-pad);
-    ctx.stroke();
-    ctx.strokeStyle = "#36d399"; ctx.lineWidth = 2; ctx.beginPath();
-    for(i=0;i<vel.length;i++){
-      var x = pad + (vel[i].t/tMax)*(W-pad-8);
-      var y = (H-pad) - (Math.abs(vel[i].v)*60/vMax)*(H-pad-8);
-      if(i) ctx.lineTo(x,y); else ctx.moveTo(x,y);
-    }
-    ctx.stroke();
-    ctx.fillStyle = "#8b949e"; ctx.font = "12px sans-serif";
-    ctx.fillText(vMax.toFixed(0)+" m/min", pad+3, 14);
-    ctx.fillText(tMax.toFixed(1)+" s", W-46, H-pad+16);
-    ctx.fillText("속도", pad+3, H-pad-4);
+  // ===== 그래프(상호작용): 십자선·눈금/격자·구간색 + 정밀확인(확대·이동·구간측정) =====
+  var chart = {
+    vel:[], cum:[], tMax:1, vMax:1, cruiseStart:0, cruiseEnd:0,
+    view:{t0:0,t1:1}, cursor:null, measure:[], precision:false,
+    pad:{l:42,r:12,t:12,b:26}, pointers:{}, pinchSpan:null, drag:null,
+    lastTapT:0, lastTapX:0, ready:false
+  };
+  function chartCv(){ return $("chart"); }
+  function plotR(){ var cv=chartCv(), p=chart.pad; return {x:p.l,y:p.t,w:cv.width-p.l-p.r,h:cv.height-p.t-p.b}; }
+  function tToX(t){ var R=plotR(), v=chart.view; return R.x + (t-v.t0)/((v.t1-v.t0)||1)*R.w; }
+  function xToT(x){ var R=plotR(), v=chart.view; return v.t0 + (x-R.x)/R.w*((v.t1-v.t0)||1); }
+  function vToY(vmin){ var R=plotR(); return R.y+R.h - (vmin/(chart.vMax||1))*R.h; }
+  function nearIdx(t){ var vel=chart.vel,b=0,bd=Infinity; for(var i=0;i<vel.length;i++){ var d=Math.abs(vel[i].t-t); if(d<bd){bd=d;b=i;} } return b; }
+  function niceTicks(min,max,target){
+    var span=max-min; if(span<=0) return [min];
+    var raw=span/target, mag=Math.pow(10,Math.floor(Math.log(raw)/Math.LN10)), n=raw/mag, step;
+    if(n<1.5)step=1; else if(n<3)step=2; else if(n<7)step=5; else step=10; step*=mag;
+    var out=[], t=Math.ceil(min/step-1e-9)*step; for(;t<=max+1e-9;t+=step) out.push(+t.toFixed(6)); return out;
   }
+  function buildChart(vel){
+    var c=chart,i; c.vel=vel; c.tMax=vel.length?(vel[vel.length-1].t||1):1;
+    var maxAbs=0; for(i=0;i<vel.length;i++){ var a=Math.abs(vel[i].v); if(a>maxAbs)maxAbs=a; }
+    c.vMax=(maxAbs*60*1.15)||1;
+    var cum=[0]; for(i=1;i<vel.length;i++){ var dt=vel[i].t-vel[i-1].t; cum.push(cum[i-1]+(Math.abs(vel[i].v)+Math.abs(vel[i-1].v))/2*dt); } c.cum=cum;
+    var thr=PLATEAU_FRAC*maxAbs, cs=-1, ce=-1;
+    for(i=0;i<vel.length;i++){ if(Math.abs(vel[i].v)>=thr){ if(cs<0)cs=i; ce=i; } }
+    c.cruiseStart=cs<0?0:cs; c.cruiseEnd=ce<0?vel.length-1:ce;
+    c.view={t0:0,t1:c.tMax}; c.cursor=null; c.measure=[];
+  }
+  function phaseLine(ctx,i0,i1,color){
+    if(i1<=i0) return; var vel=chart.vel; ctx.strokeStyle=color; ctx.lineWidth=2; ctx.beginPath();
+    for(var i=i0;i<=i1;i++){ var x=tToX(vel[i].t), y=vToY(Math.abs(vel[i].v)*60); if(i===i0)ctx.moveTo(x,y); else ctx.lineTo(x,y); }
+    ctx.stroke();
+  }
+  function drawCursor(ctx,R){
+    var p=chart.vel[chart.cursor], x=tToX(p.t), y=vToY(Math.abs(p.v)*60);
+    ctx.strokeStyle="#e6edf3"; ctx.lineWidth=1; ctx.setLineDash([4,3]);
+    ctx.beginPath(); ctx.moveTo(x,R.y); ctx.lineTo(x,R.y+R.h); ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle="#e6edf3"; ctx.beginPath(); ctx.arc(x,y,4,0,6.2832); ctx.fill();
+  }
+  function drawMeasure(ctx,R){
+    var c=chart, vel=c.vel, i;
+    if(c.measure.length===2){
+      var xa=tToX(vel[c.measure[0]].t), xb=tToX(vel[c.measure[1]].t);
+      ctx.fillStyle="rgba(54,211,153,0.12)"; ctx.fillRect(Math.min(xa,xb),R.y,Math.abs(xb-xa),R.h);
+    }
+    for(i=0;i<c.measure.length;i++){
+      var p=vel[c.measure[i]], x=tToX(p.t), y=vToY(Math.abs(p.v)*60);
+      ctx.strokeStyle="#36d399"; ctx.lineWidth=1; ctx.setLineDash([4,3]);
+      ctx.beginPath(); ctx.moveTo(x,R.y); ctx.lineTo(x,R.y+R.h); ctx.stroke(); ctx.setLineDash([]);
+      ctx.fillStyle="#36d399"; ctx.beginPath(); ctx.arc(x,y,4,0,6.2832); ctx.fill();
+      ctx.fillStyle="#e6edf3"; ctx.font="12px sans-serif"; ctx.textAlign="center"; ctx.fillText(i===0?"A":"B", x, R.y+11);
+    }
+  }
+  function renderChart(){
+    var cv=chartCv(), ctx=cv.getContext("2d"), W=cv.width, H=cv.height, R=plotR(), c=chart, v=c.view, i;
+    ctx.clearRect(0,0,W,H); if(c.vel.length<2) return;
+    ctx.font="12px sans-serif"; ctx.textBaseline="alphabetic";
+    var yt=niceTicks(0,c.vMax,4);
+    for(i=0;i<yt.length;i++){ var yy=vToY(yt[i]);
+      ctx.strokeStyle="#222a35"; ctx.lineWidth=1; ctx.beginPath(); ctx.moveTo(R.x,yy); ctx.lineTo(R.x+R.w,yy); ctx.stroke();
+      ctx.fillStyle="#8b949e"; ctx.textAlign="right"; ctx.fillText(yt[i].toFixed(0), R.x-5, yy+4);
+    }
+    var xt=niceTicks(v.t0,v.t1,5);
+    for(i=0;i<xt.length;i++){ var xx=tToX(xt[i]); if(xx<R.x-0.5||xx>R.x+R.w+0.5) continue;
+      ctx.strokeStyle="#222a35"; ctx.beginPath(); ctx.moveTo(xx,R.y); ctx.lineTo(xx,R.y+R.h); ctx.stroke();
+      ctx.fillStyle="#8b949e"; ctx.textAlign="center"; ctx.fillText(xt[i].toFixed(1), xx, R.y+R.h+15);
+    }
+    ctx.save(); ctx.beginPath(); ctx.rect(R.x,R.y,R.w,R.h); ctx.clip();
+    phaseLine(ctx,0,c.cruiseStart,"#f0c674");
+    phaseLine(ctx,c.cruiseStart,c.cruiseEnd,"#36d399");
+    phaseLine(ctx,c.cruiseEnd,c.vel.length-1,"#6aa3ff");
+    if(c.precision) drawMeasure(ctx,R); else if(c.cursor!=null) drawCursor(ctx,R);
+    ctx.restore();
+    ctx.strokeStyle="#2b323f"; ctx.lineWidth=1; ctx.beginPath();
+    ctx.moveTo(R.x,R.y); ctx.lineTo(R.x,R.y+R.h); ctx.lineTo(R.x+R.w,R.y+R.h); ctx.stroke();
+  }
+  function fmtPt(idx){ var p=chart.vel[idx]; return p.t.toFixed(2)+" s · "+(Math.abs(p.v)*60).toFixed(1)+" m/min ("+Math.abs(p.v).toFixed(3)+" m/s)"; }
+  function updateInfo(){
+    var c=chart, el=$("chartInfo"); if(!el) return;
+    if(c.precision){
+      if(!c.measure.length) el.innerHTML="정밀 확인 — 그래프에서 <b>두 지점</b>을 차례로 누르면 구간 속도·거리 계산. 손가락 둘로 확대, 끌어서 이동, 더블탭 리셋.";
+      else if(c.measure.length===1) el.innerHTML="<b>A</b> "+fmtPt(c.measure[0])+" — 두 번째 지점을 누르세요";
+      else { var a=c.measure[0],b=c.measure[1], dt=Math.abs(chart.vel[b].t-chart.vel[a].t), d=Math.abs(chart.cum[b]-chart.cum[a]), avg=dt>0?d/dt:0;
+        el.innerHTML="<b>A→B</b> Δ시간 "+dt.toFixed(2)+" s · 구간거리 "+d.toFixed(2)+" m · 평균 "+(avg*60).toFixed(1)+" m/min ("+avg.toFixed(3)+" m/s)"; }
+    } else {
+      if(c.cursor==null) el.innerHTML="세로축 m/min · 가로축 초 — 그래프를 누르면 그 지점의 시간·속도가 표시됩니다.";
+      else el.innerHTML="⏱ "+fmtPt(c.cursor);
+    }
+  }
+  function paintChart(){ renderChart(); updateInfo(); }
+  function clampView(){
+    var c=chart, v=c.view, minW=Math.max(c.tMax/60,0.2), w=v.t1-v.t0;
+    if(w<minW){ var m=(v.t0+v.t1)/2; v.t0=m-minW/2; v.t1=m+minW/2; w=minW; }
+    if(w>=c.tMax){ v.t0=0; v.t1=c.tMax; return; }
+    if(v.t0<0){ v.t1-=v.t0; v.t0=0; }
+    if(v.t1>c.tMax){ v.t0-=(v.t1-c.tMax); v.t1=c.tMax; if(v.t0<0)v.t0=0; }
+  }
+  function zoomAround(ct,factor){ var v=chart.view, w=(v.t1-v.t0)*factor, fr=(ct-v.t0)/((v.t1-v.t0)||1); v.t0=ct-fr*w; v.t1=v.t0+w; clampView(); }
+  function panByPx(dx){ var R=plotR(), v=chart.view, dt=-(dx/R.w)*(v.t1-v.t0); v.t0+=dt; v.t1+=dt; clampView(); }
+  function resetView(){ var c=chart; c.view={t0:0,t1:c.tMax}; c.measure=[]; c.cursor=null; }
+  function setPrecision(on){
+    var c=chart; c.precision=on; c.measure=[]; c.cursor=null; if(!on) resetView();
+    var b=$("preciseBtn"); if(b){ b.textContent=on?"정밀 확인 끄기":"정밀 확인"; b.classList.toggle("active",on); }
+    var rb=$("chartReset"); if(rb) rb.style.display=on?"block":"none";
+    paintChart();
+  }
+  function setupChartInput(){
+    if(chart.ready) return; chart.ready=true; var cv=chartCv(), c=chart;
+    cv.style.touchAction="none";
+    function pos(e){ var r=cv.getBoundingClientRect(); return {x:(e.clientX-r.left)*(cv.width/r.width), y:(e.clientY-r.top)*(cv.height/r.height)}; }
+    cv.addEventListener("pointerdown", function(e){
+      if(c.vel.length<2) return; var p=pos(e); c.pointers[e.pointerId]={x:p.x,y:p.y};
+      try{ cv.setPointerCapture(e.pointerId); }catch(_){}
+      var ids=Object.keys(c.pointers);
+      if(ids.length>=2){ var k=ids.slice(-2), a=c.pointers[k[0]], b=c.pointers[k[1]]; c.pinchSpan=Math.abs(a.x-b.x)||1; c.drag=null; }
+      else { c.drag={id:e.pointerId,downX:p.x,downY:p.y,lastX:p.x,moved:false,downT:Date.now()}; if(!c.precision){ c.cursor=nearIdx(xToT(p.x)); paintChart(); } }
+      e.preventDefault();
+    });
+    cv.addEventListener("pointermove", function(e){
+      if(!(e.pointerId in c.pointers)) return; var p=pos(e); c.pointers[e.pointerId]={x:p.x,y:p.y};
+      var ids=Object.keys(c.pointers);
+      if(ids.length>=2 && c.precision){
+        var k=ids.slice(-2), a=c.pointers[k[0]], b=c.pointers[k[1]], span=Math.abs(a.x-b.x)||1, ct=xToT((a.x+b.x)/2);
+        zoomAround(ct, (c.pinchSpan||span)/span); c.pinchSpan=span; paintChart(); e.preventDefault(); return;
+      }
+      if(c.drag && e.pointerId===c.drag.id){
+        if(Math.abs(p.x-c.drag.downX)>6||Math.abs(p.y-c.drag.downY)>6) c.drag.moved=true;
+        if(c.precision){ if(c.drag.moved){ panByPx(p.x-c.drag.lastX); c.drag.lastX=p.x; paintChart(); } }
+        else { c.cursor=nearIdx(xToT(p.x)); paintChart(); }
+        e.preventDefault();
+      }
+    });
+    function endPtr(e){
+      if(!(e.pointerId in c.pointers)) return;
+      var p=c.pointers[e.pointerId], wasDrag=c.drag&&e.pointerId===c.drag.id, moved=wasDrag&&c.drag.moved;
+      delete c.pointers[e.pointerId]; try{ cv.releasePointerCapture(e.pointerId); }catch(_){}
+      if(Object.keys(c.pointers).length<2) c.pinchSpan=null;
+      if(wasDrag){
+        var dur=Date.now()-c.drag.downT, isTap=!moved&&dur<500; c.drag=null;
+        if(isTap){
+          var now=Date.now();
+          if(now-c.lastTapT<300 && Math.abs(p.x-c.lastTapX)<25){ resetView(); c.lastTapT=0; paintChart(); return; }
+          c.lastTapT=now; c.lastTapX=p.x; var idx=nearIdx(xToT(p.x));
+          if(c.precision){ if(c.measure.length>=2) c.measure=[idx]; else c.measure.push(idx); }
+          else c.cursor=idx;
+          paintChart();
+        }
+      }
+    }
+    cv.addEventListener("pointerup", endPtr); cv.addEventListener("pointercancel", endPtr);
+  }
+  function drawChart(vel){ buildChart(vel); setupChartInput(); setPrecision(false); }
+  $("preciseBtn").addEventListener("click", function(){ setPrecision(!chart.precision); });
+  $("chartReset").addEventListener("click", function(){ resetView(); paintChart(); });
 
   function pushHistory(r){
     var d = new Date();
