@@ -61,37 +61,28 @@
   <div class="card">
     <div id="status" class="status">버튼을 누른 뒤 <b>3초간 정지 상태</b>를 유지하세요.</div>
     <div id="liveWrap" class="live" style="display:none">
-      <div><span id="liveVal" class="big">0.0</span></div>
-      <div class="unit">m/min (실시간)</div>
+      <div><span id="liveVal" class="big">0.00</span> <span class="unit">m/s</span></div>
+      <div class="unit"><span id="liveValMpm">0.0</span> m/min (실시간)</div>
     </div>
     <div id="countdown" class="countdown" style="display:none"></div>
   </div>
 
   <div class="card">
     <button id="btn" class="main">측정 시작</button>
-    <div class="field" style="margin-top:14px">
-      <label for="known">실제 이동거리(m) — 오차 확인용 (선택)</label>
-      <input id="known" type="number" inputmode="decimal" placeholder="예: 12.6">
-    </div>
     <button id="install" class="install">홈 화면에 앱 설치</button>
   </div>
 
   <div id="results" class="card results">
     <div class="hero">
       <div class="label">정격속도 추정 (정속 구간)</div>
-      <div><span id="cruiseMpm" class="val">–</span><span class="sub"> m/min</span></div>
-      <div class="sub"><span id="cruiseMs">–</span> m/s</div>
-    </div>
-    <div id="calWrap" class="hero" style="display:none; padding-top:0">
-      <div class="label">거리보정 정격속도 (실제거리 입력 시)</div>
-      <div><span id="calMpm" class="val">–</span><span class="sub"> m/min</span></div>
+      <div><span id="cruiseMs" class="val">–</span><span class="sub"> m/s</span></div>
+      <div class="sub"><span id="cruiseMpm">–</span> m/min</div>
     </div>
     <div class="grid">
       <div class="stat"><div class="k">최고속도</div><div id="maxMpm" class="v">–</div></div>
       <div class="stat"><div class="k">이동거리</div><div id="dist" class="v">–</div></div>
       <div class="stat"><div class="k">운행시간</div><div id="dur" class="v">–</div></div>
       <div class="stat"><div class="k">샘플링</div><div id="rate" class="v">–</div></div>
-      <div id="errStat" class="stat" style="display:none"><div class="k">거리 오차</div><div id="err" class="v err">–</div></div>
       <div class="stat"><div class="k">기준 중력</div><div id="gmag" class="v">–</div></div>
     </div>
     <canvas id="chart" width="600" height="240"></canvas>
@@ -113,7 +104,6 @@
     사용법: ① <b>정지 상태</b>에서 시작 → 3초 카운트다운(움직이면 다시 셈) → ② 안내가 뜨면 엘리베이터 운행
     (정속 구간 확보를 위해 3~4개 층 이상 권장) → ③ 도착 후 <b>3초간 멈추면 자동 종료</b>됩니다.
     가속도계 적분 방식의 <b>현장 참고용</b>이며, 공단 정식 검사(회전속도계·엔코더)를 대체하지 않습니다.
-    실제 이동거리를 입력하면 <b>거리보정 정격속도</b>가 함께 표시됩니다.
     최초 1회 온라인 접속하면 이후 <b>오프라인</b>에서도 동작합니다.
   </div>
 
@@ -179,14 +169,16 @@
     smooth(av, SMOOTH_WIN);
 
     var vel = [{t:av[0].t, v:0}], v=0, i, dt;
-    var aPrev = Math.abs(av[0].a) < ACC_GATE ? 0 : av[0].a;
-    var dz = [aPrev];   // 데드존 적용 가속도 (정지 클램프 판정용)
+    // 적분은 데드존 없는 원신호(스무딩만)로 → 가속·감속 램프 꼬리가 안 깎여 과소추정 감소.
+    // 데드존(dz)은 정지 클램프 판정에만 별도로 사용. (드리프트는 아래 끝점 보정이 제거)
+    var aPrev = av[0].a;
+    var dz = [Math.abs(av[0].a) < ACC_GATE ? 0 : av[0].a];
     for(i=1;i<av.length;i++){
-      var a = Math.abs(av[i].a) < ACC_GATE ? 0 : av[i].a;   // 가속도 데드존
+      var a = av[i].a;                                       // 원신호로 적분
       dt = av[i].t - av[i-1].t;
       v += (a + aPrev)/2 * dt;
       vel.push({t:av[i].t, v:v});
-      dz.push(a);
+      dz.push(Math.abs(av[i].a) < ACC_GATE ? 0 : av[i].a);  // 데드존은 판정용
       aPrev = a;
     }
     // 잔류 바이어스 보정: 출발·도착 v=0 -> 끝값을 0으로 선형 보정
@@ -269,7 +261,8 @@
       $("countdown").textContent = (left>0?left:1);
       $("status").textContent = "기준 측정 중… 정지 상태를 유지하세요";
     } else if(phase === "ride"){
-      $("liveVal").textContent = (Math.abs(vLive)*60).toFixed(1);
+      $("liveVal").textContent = Math.abs(vLive).toFixed(2);
+      $("liveValMpm").textContent = (Math.abs(vLive)*60).toFixed(1);
       if(hasMoved && stillSince !== null){
         var rem = Math.ceil((STOP_HOLD_MS - (now - stillSince))/1000);
         $("status").innerHTML = "정지 감지 — <b>" + (rem>0?rem:1) + "초</b> 후 자동 종료";
@@ -338,18 +331,6 @@
     $("rate").textContent = (r.n / (r.duration||1)).toFixed(0) + " Hz";
     $("gmag").textContent = r.gmag.toFixed(2) + " m/s²";
 
-    var known = parseFloat($("known").value);
-    if(!isNaN(known) && known > 0){
-      var errp = (r.dist - known)/known*100;
-      $("err").textContent = (errp>=0?"+":"") + errp.toFixed(1) + " %";
-      $("errStat").style.display = "block";
-      var calMs = r.dist > 0 ? r.cruise * (known / r.dist) : r.cruise;
-      $("calMpm").textContent = (calMs*60).toFixed(1);
-      $("calWrap").style.display = "block";
-    } else {
-      $("errStat").style.display = "none";
-      $("calWrap").style.display = "none";
-    }
     $("results").classList.add("show");
     drawChart(r.vel);
   }
