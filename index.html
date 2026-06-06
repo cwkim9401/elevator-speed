@@ -200,11 +200,12 @@
     for(i=0;i<vel.length;i++){ if(Math.abs(vel[i].v) >= PLATEAU_FRAC*maxV) plateau.push(Math.abs(vel[i].v)); }
     var cruise = median(plateau);
 
-    var dist=0;
+    var disp=0;
     for(i=1;i<vel.length;i++){
       dt = vel[i].t - vel[i-1].t;
-      dist += (Math.abs(vel[i].v) + Math.abs(vel[i-1].v))/2 * dt;
+      disp += (vel[i].v + vel[i-1].v)/2 * dt;          // 부호 있는 변위 적분
     }
+    var dist=Math.abs(disp);                            // 원점→도착 순이동(상승·하강 상쇄, 항상 양수)
     return { cruise:cruise, maxV:maxV, dist:dist, duration:tE-tS, vel:vel, gmag:base.gmag, n:samps.length };
   }
 
@@ -368,7 +369,7 @@
     c.yMax = vHi>0 ? vHi*1.15 : 0;   // 상승=양수(0선 위), 하강=음수(0선 아래)
     c.yMin = vLo<0 ? vLo*1.15 : 0;
     if(c.yMax-c.yMin < 1){ c.yMax += 0.5; c.yMin -= 0.5; }
-    var cum=[0]; for(i=1;i<vel.length;i++){ var dt=vel[i].t-vel[i-1].t; cum.push(cum[i-1]+(Math.abs(vel[i].v)+Math.abs(vel[i-1].v))/2*dt); } c.cum=cum;
+    var cum=[0]; for(i=1;i<vel.length;i++){ var dt=vel[i].t-vel[i-1].t; cum.push(cum[i-1]+(vel[i].v+vel[i-1].v)/2*dt); } c.cum=cum;   // 부호 있는 누적 변위(구간거리=두 점 순이동)
     var thr=PLATEAU_FRAC*maxAbs, cs=-1, ce=-1;
     for(i=0;i<vel.length;i++){ if(Math.abs(vel[i].v)>=thr){ if(cs<0)cs=i; ce=i; } }
     c.cruiseStart=cs<0?0:cs; c.cruiseEnd=ce<0?vel.length-1:ce;
