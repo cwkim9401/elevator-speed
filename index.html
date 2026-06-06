@@ -97,12 +97,11 @@
 
   <div id="histCard" class="card hist" style="display:none">
     <div class="row" style="margin-bottom:8px">
-      <b style="flex:1">측정 기록</b>
-      <button id="copyCsv" class="sec" style="flex:0 0 auto">CSV 복사</button>
-      <button id="clearHist" class="sec" style="flex:0 0 auto">지우기</button>
+      <b style="flex:1">측정 기록 <span style="color:var(--muted);font-weight:400;font-size:12px">— 행을 누르면 불러오기</span></b>
+      <button id="clearHist" class="sec" style="flex:0 0 auto">전체 삭제</button>
     </div>
     <table>
-      <thead><tr><th>시각</th><th>정속(m/min)</th><th>최고</th><th>거리(m)</th><th>시간(s)</th></tr></thead>
+      <thead><tr><th>시각</th><th>정속(m/s)</th><th>거리(m)</th><th>시간(s)</th><th></th></tr></thead>
       <tbody id="histBody"></tbody>
     </table>
   </div>
@@ -538,35 +537,58 @@
   $("preciseBtn").addEventListener("click", function(){ setPrecision(!chart.precision); });
   $("chartReset").addEventListener("click", function(){ resetView(); paintChart(); });
 
+  var SAVE_KEY = "elevSpeedSaved";
+  function saveHistory(){
+    try { localStorage.setItem(SAVE_KEY, JSON.stringify(history)); }
+    catch(e){ alert("기기 저장 공간이 부족하거나 저장이 차단되었습니다. 오래된 기록을 삭제해 주세요."); }
+  }
+  function loadHistory(){
+    try { var s = localStorage.getItem(SAVE_KEY); history = s ? JSON.parse(s) : []; }
+    catch(e){ history = []; }
+    if(!Array.isArray(history)) history = [];
+  }
   function pushHistory(r){
     var d = new Date();
     var hhmm = ("0"+d.getHours()).slice(-2)+":"+("0"+d.getMinutes()).slice(-2)+":"+("0"+d.getSeconds()).slice(-2);
-    history.push({ time:hhmm, cruise:(r.cruise*60), max:(r.maxV*60), dist:r.dist, dur:r.duration });
+    history.push({
+      id: Date.now()+"_"+Math.floor(Math.random()*1e6), time:hhmm,
+      cruise:r.cruise, maxV:r.maxV, dist:r.dist, duration:r.duration,
+      gmag:r.gmag, n:r.n, cruiseStart:r.cruiseStart, cruiseEnd:r.cruiseEnd,
+      vel: r.vel.map(function(p){ return { t:+p.t.toFixed(3), v:+p.v.toFixed(4) }; })
+    });
+    saveHistory();
     renderHistory();
   }
   function renderHistory(){
     if(!history.length){ $("histCard").style.display = "none"; return; }
     $("histCard").style.display = "block";
     var rows = history.map(function(h){
-      return "<tr><td>"+h.time+"</td><td>"+h.cruise.toFixed(1)+"</td><td>"+h.max.toFixed(1)+
-             "</td><td>"+h.dist.toFixed(2)+"</td><td>"+h.dur.toFixed(1)+"</td></tr>";
+      return "<tr data-id='"+h.id+"' style='cursor:pointer'><td>"+h.time+"</td><td>"+(h.cruise).toFixed(4)+
+             "</td><td>"+h.dist.toFixed(2)+"</td><td>"+h.duration.toFixed(1)+
+             "</td><td style='text-align:center'><button class='del' data-id='"+h.id+"' style='background:none;border:none;color:var(--danger);font-size:16px;line-height:1;padding:2px 6px'>✕</button></td></tr>";
     }).join("");
     $("histBody").innerHTML = rows;
   }
-  $("copyCsv").addEventListener("click", function(){
-    var lines = ["시각,정속(m/min),최고(m/min),거리(m),시간(s)"];
-    history.forEach(function(h){
-      lines.push([h.time, h.cruise.toFixed(1), h.max.toFixed(1), h.dist.toFixed(2), h.dur.toFixed(1)].join(","));
-    });
-    var text = lines.join("\n");
-    if(navigator.clipboard && navigator.clipboard.writeText){
-      navigator.clipboard.writeText(text).then(function(){ alert("CSV가 복사되었습니다."); },
-        function(){ prompt("복사하세요:", text); });
-    } else { prompt("복사하세요:", text); }
+  $("histBody").addEventListener("click", function(e){
+    var del = e.target.closest ? e.target.closest(".del") : null;
+    if(del){
+      var did = del.getAttribute("data-id");
+      history = history.filter(function(h){ return String(h.id) !== String(did); });
+      saveHistory(); renderHistory();
+      return;
+    }
+    if(recording) return;   // 측정 중에는 불러오기 보류
+    var tr = e.target.closest ? e.target.closest("tr[data-id]") : null;
+    if(!tr) return;
+    var rid = tr.getAttribute("data-id"), rec = null, i;
+    for(i=0;i<history.length;i++){ if(String(history[i].id)===String(rid)){ rec=history[i]; break; } }
+    if(rec){ showResults(rec); $("status").innerHTML = "저장된 측정(<b>"+rec.time+"</b>)을 불러왔습니다."; $("results").scrollIntoView({block:"start"}); }
   });
   $("clearHist").addEventListener("click", function(){
-    if(confirm("측정 기록을 모두 지울까요?")){ history = []; renderHistory(); }
+    if(confirm("저장된 측정 기록을 모두 삭제할까요? (기기에서 완전히 지워집니다)")){ history = []; saveHistory(); renderHistory(); }
   });
+
+  loadHistory(); renderHistory();   // 시작 시 저장된 기록 복원
 })();
 
 // ---- PWA: 서비스워커 등록 + 설치 버튼 ----
