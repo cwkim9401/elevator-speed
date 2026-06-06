@@ -429,8 +429,9 @@
         if(chart.vel[i2].t < chart.vel[i1].t){ var tmp=i1; i1=i2; i2=tmp; }              // 시간 순(앞→뒤)으로 정렬
         var dt=chart.vel[i2].t-chart.vel[i1].t, d=Math.abs(chart.cum[i2]-chart.cum[i1]), avg=dt>0?d/dt:0;
         var dv=Math.abs(chart.vel[i2].v)-Math.abs(chart.vel[i1].v), acc=dt>0?dv/dt:0;     // 속도(절댓값) 변화율 = 평균 가·감속도
-        var accAbs=Math.abs(acc), accTxt = accAbs<0.005 ? "평균 가·감속 0.00 m/s² (거의 일정)"
-                  : (acc>0?"평균 가속도 ":"평균 감속도 ")+accAbs.toFixed(2)+" m/s²";
+        var accAbs=Math.abs(acc), gN=accAbs/9.80665;                                       // 표준중력 gₙ=9.80665 m/s² 기준
+        var accTxt = accAbs<0.005 ? "평균 가·감속 0.000 g<sub>n</sub> (거의 일정)"
+                  : (acc>0?"평균 가속도 ":"평균 감속도 ")+gN.toFixed(3)+" g<sub>n</sub> ("+accAbs.toFixed(2)+" m/s²)";
         el.innerHTML="<b>A→B</b> Δ시간 "+dt.toFixed(2)+" s · 구간거리 "+d.toFixed(2)+" m<br>평균속도 "+(avg*60).toFixed(1)+" m/min ("+avg.toFixed(3)+" m/s) · "+accTxt; }
     } else {
       if(c.cursor==null) el.innerHTML="세로축 m/min · 가로축 초 — 그래프를 누르면 그 지점의 시간·속도가 표시됩니다.";
