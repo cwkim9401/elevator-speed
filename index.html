@@ -120,11 +120,8 @@
   var BASELINE_MS = 3000, SMOOTH_WIN = 5, PLATEAU_FRAC = 0.8;
   var ACC_CRUISE = 0.20;   // 정속 판정: |수직가속도|가 이 값 미만이면 '가속 끝(정속)'으로 봄
   // 드리프트 방지: ACC_GATE(m/s^2) 미만 가속도는 0으로 취급(데드존).
-  // V_FLOOR: 결과 계산용 정지 클램프 기준(m/s). (라이브 정지판정은 아래 ZUPT + STILL_V 사용)
+  // V_FLOOR: 무가속이면서 속도가 이 값(m/s) 미만이면 0으로 클램프(정지 판정).
   var ACC_GATE = 0.10, V_FLOOR = 0.15;
-  // ZUPT(라이브 정지 영점보정): 수직가속도가 QUIET_TH 미만으로 ZUPT_WIN(ms) 지속되면 '기기 정지'로 보고
-  // 속도가 STILL_V(0.20) 미만이면 0으로 스냅 → 출렁임으로 생긴 잔여 속도 제거.
-  var QUIET_TH = 0.15, ZUPT_WIN = 400;
   // 자동 종료: 운행(속도>MOVED_TH)을 마친 뒤 정지(속도<STILL_V)가 STOP_HOLD_MS 지속되면 종료.
   // 기준 카운트다운 중 |가속도|가 MOVE_RESET_TH 넘게 변하면 움직임으로 보고 카운트 리셋.
   var STOP_HOLD_MS = 3000, MOVE_RESET_TH = 0.6, MOVED_TH = 0.30, STILL_V = 0.20;
@@ -132,7 +129,7 @@
   var recording = false, phase = "idle";
   var samples = [], baselineSamples = [], baseline = null;
   var recordStart = 0, vLive = 0, lastLive = null, ticker = null, history = [];
-  var stillSince = null, hasMoved = false, baseMag = null, quietSince = null;
+  var stillSince = null, hasMoved = false, baseMag = null;
   var gravMode = "base", gravPref = "auto", lastGravActual = null;  // 중력제거: os(e.acceleration) / base(고정기준)
 
   var $ = function(id){ return document.getElementById(id); };
@@ -258,7 +255,7 @@
       if(elapsed >= BASELINE_MS){
         baseline = computeBaseline(baselineSamples);
         phase = "ride";
-        vLive = 0; hasMoved = false; stillSince = null; quietSince = null;
+        vLive = 0; hasMoved = false; stillSince = null;
         gravMode = decideGravMode(baselineSamples);   // OS 선형가속도 사용 여부 결정
         var a0 = vertAccel(baseline, s);
         lastLive = { t:t, aVert: Math.abs(a0) < ACC_GATE ? 0 : a0 };
@@ -273,15 +270,11 @@
         var dt = (t - lastLive.t)/1000;
         vLive += (aVert + lastLive.aVert)/2 * dt;
       }
+      if(aVert === 0 && Math.abs(vLive) < V_FLOOR) vLive = 0; // 정지 클램프(무가속 & 최저속도 미만)
       lastLive = { t:t, aVert:aVert };
-      // ZUPT(정지 영점보정): 수직가속도가 ZUPT_WIN 동안 계속 작으면 '기기 정지'로 판단
-      if(Math.abs(aRaw) < QUIET_TH){ if(quietSince === null) quietSince = t; }
-      else quietSince = null;
-      var atRest = (quietSince !== null && (t - quietSince) >= ZUPT_WIN);
-      if(atRest && Math.abs(vLive) < STILL_V) vLive = 0;      // 정지 시 속도 0으로 스냅(출렁 잔여 제거)
       if(Math.abs(vLive) > MOVED_TH) hasMoved = true;
-      // 운행을 마치고 다시 정지(atRest)가 STOP_HOLD_MS 지속되면 자동 종료
-      var stationary = (atRest && Math.abs(vLive) < STILL_V);
+      // 운행을 마치고 다시 정지 상태가 STOP_HOLD_MS 지속되면 자동 종료
+      var stationary = (aVert === 0 && Math.abs(vLive) < STILL_V);
       if(hasMoved && stationary){
         if(stillSince === null) stillSince = t;
         else if(t - stillSince >= STOP_HOLD_MS){ finishMeasurement(true); return; }
@@ -317,7 +310,7 @@
       recording = true; phase = "baseline";
       samples = []; baselineSamples = []; baseline = null;
       vLive = 0; lastLive = null; recordStart = performance.now();
-      baseMag = null; stillSince = null; hasMoved = false; quietSince = null;
+      baseMag = null; stillSince = null; hasMoved = false;
       $("results").classList.remove("show");
       $("liveWrap").style.display = "none";
       $("countdown").style.display = "block";
