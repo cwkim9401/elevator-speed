@@ -149,7 +149,7 @@
   var recordStart = 0, vLive = 0, lastLive = null, ticker = null, history = [];
   var stillSince = null, hasMoved = false, baseMag = null;
   var gravMode = "base", gravPref = "auto", lastGravActual = null;  // 중력제거: gyro(자이로 융합) / base(고정 기준)
-  var gVec = null, gmag0 = 9.81;   // 추정 중력벡터(라이브) / 기준 중력 크기
+  var gVec = null, gmag0 = 9.81, gBias = {ra:0,rb:0,rg:0};   // 추정 중력벡터 / 기준 중력 크기 / 자이로 영점(바이어스)
 
   var $ = function(id){ return document.getElementById(id); };
   var btn = $("btn");
@@ -179,9 +179,9 @@
     return (s.x*gx + s.y*gy + s.z*gz)/gm - b.gmag;
   }
   // 자이로 융합 1스텝: 중력벡터 gv를 자이로로 회전 예측한 뒤 가속도로 적응 보정.
-  function gravStep(gv, s, dt, gm0){
+  function gravStep(gv, s, dt, gm0, gb){
     if(s.ra != null && dt > 0){               // 자이로 예측: gv += -(ω × gv) dt  (월드고정 벡터의 기기프레임 회전)
-      var wx=s.rb*DEG, wy=s.rg*DEG, wz=s.ra*DEG;
+      var wx=(s.rb-gb.rb)*DEG, wy=(s.rg-gb.rg)*DEG, wz=(s.ra-gb.ra)*DEG;   // 자이로 영점(바이어스) 제거 후 사용
       var cx=wy*gv.z - wz*gv.y, cy=wz*gv.x - wx*gv.z, cz=wx*gv.y - wy*gv.x;
       gv = { x: gv.x - cx*dt, y: gv.y - cy*dt, z: gv.z - cz*dt };
     }
@@ -194,6 +194,11 @@
     return ((s.x-gv.x)*gv.x + (s.y-gv.y)*gv.y + (s.z-gv.z)*gv.z)/gm;
   }
   function gvecFromBase(b){ return { x:b.gh.x*b.gmag, y:b.gh.y*b.gmag, z:b.gh.z*b.gmag }; }
+  function computeGyroBias(samps){   // 기준(정지) 구간 rotationRate 평균 = 자이로 영점
+    var sa=0, sb=0, sg=0, n=0, i;
+    for(i=0;i<samps.length;i++){ if(samps[i].ra != null){ sa+=samps[i].ra; sb+=samps[i].rb; sg+=samps[i].rg; n++; } }
+    return n ? { ra:sa/n, rb:sb/n, rg:sg/n } : { ra:0, rb:0, rg:0 };
+  }
   function decideGravMode(samps){
     if(gravPref === "base") return "base";
     var n=samps.length||1, withG=0, withL=0, i;
@@ -226,8 +231,8 @@
     var base = computeBaseline(baseSamps.length ? baseSamps : samps.slice(0,10));
     var av;
     if(gravMode === "gyro"){          // 자이로 융합으로 매 샘플 중력방향 추적
-      var gv = gvecFromBase(base), pT = samps[0].t;
-      av = samps.map(function(s){ var d=(s.t-pT)/1000; pT=s.t; gv=gravStep(gv,s,d,base.gmag); return { t:(s.t-t0)/1000, a:vertFromG(gv,s) }; });
+      var gv = gvecFromBase(base), pT = samps[0].t, gb = computeGyroBias(baseSamps);
+      av = samps.map(function(s){ var d=(s.t-pT)/1000; pT=s.t; gv=gravStep(gv,s,d,base.gmag,gb); return { t:(s.t-t0)/1000, a:vertFromG(gv,s) }; });
     } else if(gravMode === "os"){     // 개선된 OS(방향 전용)
       av = samps.map(function(s){ return { t:(s.t-t0)/1000, a:vertAccelOS(base,s) }; });
     } else {
@@ -304,7 +309,7 @@
         baseline = computeBaseline(baselineSamples);
         phase = "ride";
         vLive = 0; hasMoved = false; stillSince = null;
-        gmag0 = baseline.gmag; gravMode = decideGravMode(baselineSamples); gVec = gvecFromBase(baseline);
+        gmag0 = baseline.gmag; gravMode = decideGravMode(baselineSamples); gVec = gvecFromBase(baseline); gBias = computeGyroBias(baselineSamples);
         var a0 = (gravMode === "gyro") ? vertFromG(gVec, s) : (gravMode === "os" ? vertAccelOS(baseline, s) : vertAccel(baseline, s));
         lastLive = { t:t, aVert: Math.abs(a0) < ACC_GATE ? 0 : a0 };
         $("countdown").style.display = "none";
@@ -314,7 +319,7 @@
     } else if(phase === "ride"){
       var dt = lastLive ? (t - lastLive.t)/1000 : 0;
       var aRaw;
-      if(gravMode === "gyro"){ gVec = gravStep(gVec, s, dt, gmag0); aRaw = vertFromG(gVec, s); }
+      if(gravMode === "gyro"){ gVec = gravStep(gVec, s, dt, gmag0, gBias); aRaw = vertFromG(gVec, s); }
       else if(gravMode === "os"){ aRaw = vertAccelOS(baseline, s); }
       else { aRaw = vertAccel(baseline, s); }
       var aVert = Math.abs(aRaw) < ACC_GATE ? 0 : aRaw;       // 가속도 데드존
