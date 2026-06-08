@@ -55,7 +55,22 @@
 </style>
 </head>
 <body>
-  <h1>엘리베이터 속도 측정기</h1>
+  <div style="display:flex; align-items:center; gap:8px; margin:4px 0 12px">
+    <h1 style="flex:1; margin:0">엘리베이터 속도 측정기</h1>
+    <button id="settingsBtn" class="sec" style="flex:0 0 auto; font-size:18px; padding:6px 12px" aria-label="설정">⚙</button>
+  </div>
+
+  <div id="settingsCard" class="card" style="display:none">
+    <div class="row" style="margin-bottom:8px"><b style="flex:1">설정</b><button id="settingsClose" class="sec" style="flex:0 0 auto">닫기</button></div>
+    <div class="note" style="margin-bottom:6px">중력제거 방식 (라이브·결과에 적용)</div>
+    <div class="row">
+      <button class="sec gravopt" data-mode="auto">자동</button>
+      <button class="sec gravopt" data-mode="base">기준</button>
+      <button class="sec gravopt" data-mode="os">OS</button>
+      <button class="sec gravopt" data-mode="gyro">자이로</button>
+    </div>
+    <div class="note" style="margin-top:8px; font-size:12px">자동: OS 값 있으면 OS, 없으면 기준 · OS는 기울기 보정(거치 시 기준과 거의 동일) · 변경은 <b>다음 측정</b>부터 적용</div>
+  </div>
 
   <div id="banner" class="banner"></div>
 
@@ -80,7 +95,7 @@
       <div><span id="cruiseMs" class="val">–</span><span class="sub"> m/s</span></div>
       <div class="sub"><span id="cruiseMpm">–</span> m/min</div>
     </div>
-    <div id="gravTag" class="note" style="text-align:right; margin:-4px 0 8px; cursor:pointer">중력제거: – · 방식 자동 · 탭하여 변경</div>
+    <div id="gravTag" class="note" style="text-align:right; margin:-4px 0 8px">중력제거: –</div>
     <div class="grid">
       <div class="stat"><div class="k">최고속도</div><div id="maxMpm" class="v">–</div></div>
       <div class="stat"><div class="k">이동거리</div><div id="dist" class="v">–</div></div>
@@ -157,6 +172,12 @@
     return { gh:{x:gx/gmag,y:gy/gmag,z:gz/gmag}, gmag:gmag };
   }
   function vertAccel(b, s){ return s.x*b.gh.x + s.y*b.gh.y + s.z*b.gh.z - b.gmag; }
+  // 개선된 OS(방향 전용): OS는 중력 '방향'만, 크기는 원시 가속도 + 고정 기준중력 → 고역통과 손상 없음
+  function vertAccelOS(b, s){
+    if(s.lx == null) return vertAccel(b, s);
+    var gx=s.x-s.lx, gy=s.y-s.ly, gz=s.z-s.lz; var gm=Math.hypot(gx,gy,gz)||1;
+    return (s.x*gx + s.y*gy + s.z*gz)/gm - b.gmag;
+  }
   // 자이로 융합 1스텝: 중력벡터 gv를 자이로로 회전 예측한 뒤 가속도로 적응 보정.
   function gravStep(gv, s, dt, gm0){
     if(s.ra != null && dt > 0){               // 자이로 예측: gv += -(ω × gv) dt  (월드고정 벡터의 기기프레임 회전)
@@ -175,8 +196,12 @@
   function gvecFromBase(b){ return { x:b.gh.x*b.gmag, y:b.gh.y*b.gmag, z:b.gh.z*b.gmag }; }
   function decideGravMode(samps){
     if(gravPref === "base") return "base";
-    var withG=0; for(var i=0;i<samps.length;i++){ if(samps[i].ra != null) withG++; }
-    return (samps.length>0 && withG >= samps.length*0.5) ? "gyro" : "base";   // 자이로 있으면 융합, 없으면 기준
+    var n=samps.length||1, withG=0, withL=0, i;
+    for(i=0;i<samps.length;i++){ if(samps[i].ra != null) withG++; if(samps[i].lx != null) withL++; }
+    var hasGyro = withG >= n*0.5, hasOS = withL >= n*0.5;
+    if(gravPref === "gyro") return hasGyro ? "gyro" : "base";
+    if(gravPref === "os")   return hasOS ? "os" : "base";
+    return hasGyro ? "gyro" : (hasOS ? "os" : "base");   // 자동: 자이로 > OS > 기준
   }
 
   function median(arr){
@@ -203,6 +228,8 @@
     if(gravMode === "gyro"){          // 자이로 융합으로 매 샘플 중력방향 추적
       var gv = gvecFromBase(base), pT = samps[0].t;
       av = samps.map(function(s){ var d=(s.t-pT)/1000; pT=s.t; gv=gravStep(gv,s,d,base.gmag); return { t:(s.t-t0)/1000, a:vertFromG(gv,s) }; });
+    } else if(gravMode === "os"){     // 개선된 OS(방향 전용)
+      av = samps.map(function(s){ return { t:(s.t-t0)/1000, a:vertAccelOS(base,s) }; });
     } else {
       av = samps.map(function(s){ return { t:(s.t-t0)/1000, a:vertAccel(base,s) }; });
     }
@@ -259,6 +286,8 @@
     var s = { t:t, x:a.x, y:a.y, z:a.z };
     var rr = e.rotationRate;
     if(rr && rr.alpha != null){ s.ra = rr.alpha; s.rb = rr.beta; s.rg = rr.gamma; }   // 자이로(deg/s)
+    var aL = e.acceleration;
+    if(aL && aL.x != null){ s.lx = aL.x; s.ly = aL.y; s.lz = aL.z; }                   // OS 선형가속도(방향용)
     samples.push(s);
     var elapsed = t - recordStart;
 
@@ -276,7 +305,7 @@
         phase = "ride";
         vLive = 0; hasMoved = false; stillSince = null;
         gmag0 = baseline.gmag; gravMode = decideGravMode(baselineSamples); gVec = gvecFromBase(baseline);
-        var a0 = (gravMode === "gyro") ? vertFromG(gVec, s) : vertAccel(baseline, s);
+        var a0 = (gravMode === "gyro") ? vertFromG(gVec, s) : (gravMode === "os" ? vertAccelOS(baseline, s) : vertAccel(baseline, s));
         lastLive = { t:t, aVert: Math.abs(a0) < ACC_GATE ? 0 : a0 };
         $("countdown").style.display = "none";
         $("liveWrap").style.display = "block";
@@ -286,6 +315,7 @@
       var dt = lastLive ? (t - lastLive.t)/1000 : 0;
       var aRaw;
       if(gravMode === "gyro"){ gVec = gravStep(gVec, s, dt, gmag0); aRaw = vertFromG(gVec, s); }
+      else if(gravMode === "os"){ aRaw = vertAccelOS(baseline, s); }
       else { aRaw = vertAccel(baseline, s); }
       var aVert = Math.abs(aRaw) < ACC_GATE ? 0 : aRaw;       // 가속도 데드존
       if(lastLive){ vLive += (aVert + lastLive.aVert)/2 * dt; }
@@ -606,20 +636,31 @@
     if(confirm("저장된 측정 기록을 모두 삭제할까요? (기기에서 완전히 지워집니다)")){ history = []; saveHistory(); renderHistory(); }
   });
 
-  function gravPrefLabel(){ return gravPref==="gyro"?"자이로 고정":(gravPref==="base"?"기준 고정":"자동"); }
+  function gravLabel(m){ return m==="gyro"?"자이로":(m==="os"?"OS":(m==="base"?"기준":"–")); }
+  function gravPrefLabel(){ return gravPref==="auto"?"자동":gravLabel(gravPref)+" 고정"; }
   function updateGravTag(){
     var el=$("gravTag"); if(!el) return;
-    var a = lastGravActual==="gyro"?"자이로융합":(lastGravActual==="base"?"기준":"–");
-    el.innerHTML = "중력제거: <b>"+a+"</b> · 방식 <b>"+gravPrefLabel()+"</b> · 탭하여 변경";
+    el.innerHTML = "중력제거: <b>"+gravLabel(lastGravActual)+"</b> · 설정 "+gravPrefLabel();
   }
-  $("gravTag").addEventListener("click", function(){
-    gravPref = gravPref==="auto" ? "gyro" : (gravPref==="gyro" ? "base" : "auto");
-    try{ localStorage.setItem("elevGravPref2", gravPref); }catch(e){}
-    updateGravTag();
-    $("status").innerHTML = "중력제거 방식: <b>"+gravPrefLabel()+"</b> — <b>다음 측정</b>부터 적용됩니다.";
+  function renderGravBtns(){
+    var btns=document.querySelectorAll(".gravopt"), i;
+    for(i=0;i<btns.length;i++){ btns[i].classList.toggle("active", btns[i].getAttribute("data-mode")===gravPref); }
+  }
+  $("settingsBtn").addEventListener("click", function(){
+    var c=$("settingsCard"); c.style.display = (c.style.display==="block") ? "none" : "block";
   });
-  try{ var gp=localStorage.getItem("elevGravPref2"); if(gp==="gyro"||gp==="base"||gp==="auto") gravPref=gp; }catch(e){}
-  updateGravTag();
+  $("settingsClose").addEventListener("click", function(){ $("settingsCard").style.display="none"; });
+  (function(){
+    var btns=document.querySelectorAll(".gravopt"), i;
+    for(i=0;i<btns.length;i++){ btns[i].addEventListener("click", function(){
+      gravPref = this.getAttribute("data-mode");
+      try{ localStorage.setItem("elevGravPref2", gravPref); }catch(e){}
+      renderGravBtns(); updateGravTag();
+      $("status").innerHTML = "중력제거 방식: <b>"+gravPrefLabel()+"</b> — <b>다음 측정</b>부터 적용됩니다.";
+    }); }
+  })();
+  try{ var gp=localStorage.getItem("elevGravPref2"); if(gp==="gyro"||gp==="os"||gp==="base"||gp==="auto") gravPref=gp; }catch(e){}
+  renderGravBtns(); updateGravTag();
 
   loadHistory(); renderHistory();   // 시작 시 저장된 기록 복원
 })();
