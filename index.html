@@ -116,7 +116,7 @@
 <script>
 (function(){
   "use strict";
-  var BASELINE_MS = 3000, SMOOTH_WIN = 13, PLATEAU_FRAC = 0.8;
+  var BASELINE_MS = 3000, SMOOTH_MS = 250, PLATEAU_FRAC = 0.8;
   var TARGET_SENSOR_HZ = 120; // 지원 기기에서는 Generic Sensor API로 이 주파수를 요청한다.
   var ACC_CRUISE = 0.20;   // 정속 판정: |수직가속도|가 이 값 미만이면 '가속 끝(정속)'으로 봄
   // 드리프트 방지: ACC_GATE(m/s^2) 미만 가속도는 0으로 취급(데드존).
@@ -160,22 +160,26 @@
     var m = Math.floor(s.length/2);
     return s.length%2 ? s[m] : (s[m-1]+s[m])/2;
   }
-  function smooth(av, win){
-    var half=Math.floor(win/2), out=[], i, j, sum, c;
+  function smooth(av, winMs){
+    var half=(winMs/1000)/2, out=[], i, start=0, end=0, sum=0, count;
     for(i=0;i<av.length;i++){
-      sum=0; c=0;
-      for(j=i-half;j<=i+half;j++){ if(j>=0 && j<av.length){ sum+=av[j].a; c++; } }
-      out.push(sum/c);
+      while(start<end && av[start].t < av[i].t-half){ sum-=av[start].a; start++; }
+      while(end<av.length && av[end].t <= av[i].t+half){ sum+=av[end].a; end++; }
+      count=end-start;
+      out.push(count ? sum/count : av[i].a);
     }
     for(i=0;i<av.length;i++) av[i].a=out[i];
   }
 
   function process(samps){
-    var t0 = samps[0].t;
-    var baseSamps = samps.filter(function(s){ return s.t-t0 < BASELINE_MS; });
+    var recordT0 = samps[0].t;
+    var baseSamps = samps.filter(function(s){ return s.t-recordT0 < BASELINE_MS; });
     var base = computeBaseline(baseSamps.length ? baseSamps : samps.slice(0,10));
-    var av = samps.map(function(s){ return { t:(s.t-t0)/1000, a:vertAccel(base,s) }; });
-    smooth(av, SMOOTH_WIN);
+    var rideSamps = samps.filter(function(s){ return s.t-recordT0 >= BASELINE_MS; });
+    if(rideSamps.length < 2) rideSamps = samps.slice(Math.max(0, samps.length-2));
+    var rideT0 = rideSamps[0].t;
+    var av = rideSamps.map(function(s){ return { t:(s.t-rideT0)/1000, a:vertAccel(base,s) }; });
+    smooth(av, SMOOTH_MS);
 
     var vel = [{t:av[0].t, v:0}], v=0, i, dt;
     // 적분은 데드존 없는 원신호(스무딩만)로 → 가속·감속 램프 꼬리가 안 깎여 과소추정 감소.
@@ -217,7 +221,7 @@
       disp += (vel[i].v + vel[i-1].v)/2 * dt;          // 부호 있는 변위 적분
     }
     var dist=Math.abs(disp);                            // 원점→도착 순이동(상승·하강 상쇄, 항상 양수)
-    return { cruise:cruise, maxV:maxV, dist:dist, duration:tE-tS, vel:vel, cruiseStart:cs, cruiseEnd:ce, gmag:base.gmag, n:samps.length, endDrift:Math.abs(vEnd), sensor:activeSensor };
+    return { cruise:cruise, maxV:maxV, dist:dist, duration:tE-tS, vel:vel, cruiseStart:cs, cruiseEnd:ce, gmag:base.gmag, n:rideSamps.length, endDrift:Math.abs(vEnd), sensor:activeSensor };
   }
 
   function recordSample(x, y, z, t){
