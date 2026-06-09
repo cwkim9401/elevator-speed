@@ -119,19 +119,35 @@
   var BASELINE_MS = 3000, SMOOTH_MS = 250, PLATEAU_FRAC = 0.8;
   var TARGET_SENSOR_HZ = 120; // 지원 기기에서는 Generic Sensor API로 이 주파수를 요청한다.
   var ACC_CRUISE = 0.20;   // 정속 판정: |수직가속도|가 이 값 미만이면 '가속 끝(정속)'으로 봄
-  // 드리프트 방지: ACC_GATE(m/s^2) 미만 가속도는 0으로 취급(데드존).
-  // V_FLOOR: 무가속이면서 속도가 이 값(m/s) 미만이면 0으로 클램프(정지 판정).
-  var ACC_GATE = 0.08, V_FLOOR = 0.10;
-  // 자동 종료: 운행(속도>MOVED_TH)을 마친 뒤 정지(속도<STILL_V)가 STOP_HOLD_MS 지속되면 종료.
-  // 기준 카운트다운 중 |가속도|가 MOVE_RESET_TH 넘게 변하면 움직임으로 보고 카운트 리셋.
-  var STOP_HOLD_MS = 3000, MOVE_RESET_TH = 0.6, MOVED_TH = 0.25, STILL_V = 0.15;
-  var STILL_WINDOW_MS = 800, STILL_ACC_AVG = 0.12;
+  var BASELINE_TRIM_MS = 400;  // 시작 직후(탭 진동) 구간은 기준 평균에서 제외
+  var DT_CAP = 0.2;            // dt 폭주(탭 전환·GC 멈춤) 방지: 적분 dt 상한(초)
+  var ACC_GATE = 0.08, V_FLOOR = 0.10; // 후처리 정지 클램프용(데드존/최저속도)
+
+  // ── 라이브 자동종료 검출 채널(적분속도 vDet + 온라인 바이어스 보정) ──
+  // vLive 데드존 방식의 '속도 드리프트 고착' 문제를 해결한다. 데드존으로 속도를 얼리는 대신
+  // 조용한 구간에서 센서 바이어스를 계속 추정·차감해 vDet가 표류하지 않게 하고, ZUPT로 0 고정.
+  var STOP_HOLD_MS = 3000;     // 운행 후 정지가 이만큼 지속되면 자동 종료
+  var MOVE_RESET_TH = 0.6;     // 기준 카운트다운 중 |가속도| 변화가 이보다 크면 리셋
+  var MOVED_TH = 0.25;         // vDet가 이 값을 넘으면 '운행 시작'으로 본다
+  var MOVE_ACC_TH = 0.35, MOVE_ACC_MS = 400; // 느린 크리프 대비: 가속도 지속으로도 운행 시작 판정
+  var STILL_V = 0.15;          // ZUPT/정지 판정 속도 임계
+  var STILL_WINDOW_MS = 800;   // 정지 판정 슬라이딩 윈도 길이
+  var QUIET_SD = 0.22;         // 윈도 표준편차가 이 값 미만이면 '조용함'(바이어스 영향 없음)
+  var BIAS_TAU = 2.0;          // 바이어스 EMA 시정수(초)
+  var BIAS_GATE = 0.12;        // |윈도평균-현재바이어스|가 이 값 미만일 때만 바이어스 갱신(램프 제외)
+  // 폴백(레스큐): 장시간 '엄격 조용' 지속 시 정지로 확정해 고착/틸트에서 회복
+  var RESCUE_QUIET_MS = 6000, RESCUE_HARD_MS = 12000, RESCUE_V = 0.6;
+  var IDLE_TIMEOUT_MS = 120000; // 운행 없이 방치되면 자동 취소
 
   var recording = false, phase = "idle";
   var samples = [], baselineSamples = [], baseline = null;
-  var recordStart = 0, vLive = 0, lastLive = null, ticker = null, history = [];
+  var recordStart = 0, rideStartT = 0, ticker = null, history = [];
   var stillSince = null, hasMoved = false, baseMag = null, stillWindow = [];
+  // 라이브 검출 상태
+  var vDet = 0, biasA = 0, lastDetT = null, aDetPrev = 0;
+  var moveAccSince = null, quietSince = null, sigmaBase = 0.03;
   var motionSensor = null, sensorFallbackTimer = null, activeSensor = "devicemotion";
+  var wakeLock = null;
 
   var $ = function(id){ return document.getElementById(id); };
   var btn = $("btn");
@@ -154,6 +170,14 @@
     return { gh:{x:gx/gmag,y:gy/gmag,z:gz/gmag}, gmag:gmag };
   }
   function vertAccel(b, s){ return s.x*b.gh.x + s.y*b.gh.y + s.z*b.gh.z - b.gmag; }
+  // 기준 구간 수직가속도의 표준편차(센서/거치 노이즈 바닥). 적응형 임계의 기준값.
+  function baselineSigma(b, samps){
+    var n = samps.length, i, a, s1 = 0, s2 = 0;
+    if(n < 2) return 0.03;
+    for(i=0;i<n;i++){ a = vertAccel(b, samps[i]); s1 += a; s2 += a*a; }
+    var mean = s1/n, varr = Math.max(0, s2/n - mean*mean);
+    return Math.sqrt(varr);
+  }
 
   function median(arr){
     if(!arr.length) return 0;
@@ -174,7 +198,9 @@
 
   function process(samps){
     var recordT0 = samps[0].t;
-    var baseSamps = samps.filter(function(s){ return s.t-recordT0 < BASELINE_MS; });
+    // 기준 평균: 시작 직후 BASELINE_TRIM_MS(탭 진동)는 빼고, 나머지 기준 구간만 사용
+    var baseSamps = samps.filter(function(s){ var e=s.t-recordT0; return e>=BASELINE_TRIM_MS && e<BASELINE_MS; });
+    if(baseSamps.length < 5) baseSamps = samps.filter(function(s){ return s.t-recordT0 < BASELINE_MS; });
     var base = computeBaseline(baseSamps.length ? baseSamps : samps.slice(0,10));
     var rideSamps = samps.filter(function(s){ return s.t-recordT0 >= BASELINE_MS; });
     if(rideSamps.length < 2) rideSamps = samps.slice(Math.max(0, samps.length-2));
@@ -189,7 +215,7 @@
     var dz = [Math.abs(av[0].a) < ACC_GATE ? 0 : av[0].a];
     for(i=1;i<av.length;i++){
       var a = av[i].a;                                       // 원신호로 적분
-      dt = av[i].t - av[i-1].t;
+      dt = Math.min(av[i].t - av[i-1].t, DT_CAP);            // dt 상한(신호 끊김 시 폭주 방지)
       v += (a + aPrev)/2 * dt;
       vel.push({t:av[i].t, v:v});
       dz.push(Math.abs(av[i].a) < ACC_GATE ? 0 : av[i].a);  // 데드존은 판정용
@@ -222,7 +248,12 @@
       disp += (vel[i].v + vel[i-1].v)/2 * dt;          // 부호 있는 변위 적분
     }
     var dist=Math.abs(disp);                            // 원점→도착 순이동(상승·하강 상쇄, 항상 양수)
-    return { cruise:cruise, maxV:maxV, dist:dist, duration:tE-tS, vel:vel, cruiseStart:cs, cruiseEnd:ce, gmag:base.gmag, n:rideSamps.length, endDrift:Math.abs(vEnd), sensor:activeSensor };
+    // 운행시간: 실제 움직인 구간(첫 이동~정지 직전)만 — 끝의 정지 대기 3초가 포함되지 않게
+    var mvFirst=-1, mvLast=-1;
+    for(i=0;i<vel.length;i++){ if(absV[i] > STILL_V){ if(mvFirst<0) mvFirst=i; mvLast=i; } }
+    var fullSpan = tE - tS;
+    var moveDur = (mvFirst>=0 && mvLast>mvFirst) ? (vel[mvLast].t - vel[mvFirst].t) : fullSpan;
+    return { cruise:cruise, maxV:maxV, dist:dist, duration:moveDur, fullSpan:fullSpan, vel:vel, cruiseStart:cs, cruiseEnd:ce, gmag:base.gmag, n:rideSamps.length, endDrift:Math.abs(vEnd), sensor:activeSensor };
   }
 
   function recordSample(x, y, z, t){
@@ -240,49 +271,89 @@
         return;
       }
       baseMag = (baseMag === null) ? mag : baseMag*0.9 + mag*0.1;
-      baselineSamples.push(s);
+      if(elapsed >= BASELINE_TRIM_MS) baselineSamples.push(s);   // 시작 직후 탭 진동 제외
       if(elapsed >= BASELINE_MS){
-        baseline = computeBaseline(baselineSamples);
-        phase = "ride";
-        vLive = 0; hasMoved = false; stillSince = null; stillWindow = [];
-        var a0 = vertAccel(baseline, s);
-        lastLive = { t:t, aVert: Math.abs(a0) < ACC_GATE ? 0 : a0 };
+        baseline = computeBaseline(baselineSamples.length ? baselineSamples : samples);
+        sigmaBase = baselineSigma(baseline, baselineSamples.length ? baselineSamples : samples);
+        phase = "ride"; rideStartT = t;
+        vDet = 0; biasA = 0; lastDetT = t; aDetPrev = 0;
+        hasMoved = false; stillSince = null; stillWindow = [];
+        moveAccSince = null; quietSince = null;
         $("countdown").style.display = "none";
         $("liveWrap").style.display = "block";
         $("status").innerHTML = "<b>지금 엘리베이터를 운행하세요</b> — 멈추면 <b>자동 종료</b>됩니다";
       }
     } else if(phase === "ride"){
-      var dt = lastLive ? (t - lastLive.t)/1000 : 0;
+      var dt = lastDetT !== null ? Math.min((t - lastDetT)/1000, DT_CAP) : 0;
+      lastDetT = t;
       var aRaw = vertAccel(baseline, s);
-      var aVert = Math.abs(aRaw) < ACC_GATE ? 0 : aRaw;       // 가속도 데드존
-      if(lastLive){ vLive += (aVert + lastLive.aVert)/2 * dt; }
-      if(aVert === 0 && Math.abs(vLive) < V_FLOOR) vLive = 0; // 정지 클램프(무가속 & 최저속도 미만)
-      lastLive = { t:t, aVert:aVert };
-      if(Math.abs(vLive) > MOVED_TH) hasMoved = true;
-      // 운행을 마치고 최근 짧은 구간까지 조용하면 정지로 본다. 순간값보다 진동/샘플 튐에 덜 흔들린다.
-      stillWindow.push({ t:t, a:Math.abs(aRaw) });
+      var aCorr = aRaw - biasA;                               // 바이어스 차감(데드존 없음)
+      vDet += (aCorr + aDetPrev)/2 * dt;                      // 적분
+      aDetPrev = aCorr;
+
+      // 슬라이딩 윈도: 부호 있는 수직가속도. 평균=현재 바이어스 추정용, 표준편차=조용함 판정용.
+      stillWindow.push({ t:t, a:aRaw });
       while(stillWindow.length && t-stillWindow[0].t > STILL_WINDOW_MS) stillWindow.shift();
-      var accSum = 0;
-      for(var wi=0; wi<stillWindow.length; wi++) accSum += stillWindow[wi].a;
-      var windowSpan = stillWindow.length ? t-stillWindow[0].t : 0;
-      var recentCalm = windowSpan >= STILL_WINDOW_MS*0.5 &&
-                       (accSum/Math.max(stillWindow.length,1)) < STILL_ACC_AVG;
-      if(recentCalm && Math.abs(vLive) < STILL_V) vLive = 0;
-      var stationary = (recentCalm && Math.abs(vLive) < STILL_V);
+      var n = stillWindow.length, wi, s1 = 0, s2 = 0;
+      for(wi=0; wi<n; wi++){ s1 += stillWindow[wi].a; s2 += stillWindow[wi].a*stillWindow[wi].a; }
+      var wMean = n ? s1/n : aRaw;
+      var wSd = n ? Math.sqrt(Math.max(0, s2/n - wMean*wMean)) : 0;
+      var windowSpan = n ? t-stillWindow[0].t : 0;
+      var ready = windowSpan >= STILL_WINDOW_MS*0.5;
+      var quiet = ready && wSd < QUIET_SD;
+
+      // 온라인 바이어스 보정: 조용하고 윈도평균이 현재 바이어스와 가까울 때만(램프 배제)
+      if(quiet && Math.abs(wMean - biasA) < BIAS_GATE){
+        var alpha = Math.min(1, dt / BIAS_TAU);
+        biasA += alpha * (wMean - biasA);
+      }
+      // ZUPT: 조용하고 속도가 낮으면 0으로 고정(고착 없이 0으로 복귀)
+      if(quiet && Math.abs(vDet) < STILL_V) vDet = 0;
+
+      // 운행 시작 판정: 속도 임계 또는 지속 가속도(느린 크리프 대비)
+      if(Math.abs(vDet) > MOVED_TH) hasMoved = true;
+      if(Math.abs(aCorr) > MOVE_ACC_TH){
+        if(moveAccSince === null) moveAccSince = t;
+        else if(t - moveAccSince >= MOVE_ACC_MS) hasMoved = true;
+      } else moveAccSince = null;
+
+      // 폴백(레스큐): 장시간 '엄격 조용'이면 고착/틸트로 보고 vDet·바이어스 재설정
+      var strictSd = Math.max(2.0*sigmaBase, 0.03);
+      if(ready && wSd < strictSd){
+        if(quietSince === null) quietSince = t;
+        else {
+          var qd = t - quietSince;
+          if(hasMoved && ((qd >= RESCUE_QUIET_MS && Math.abs(vDet) < RESCUE_V) || qd >= RESCUE_HARD_MS)){
+            vDet = 0; biasA = wMean; quietSince = t;   // 0으로 재설정 후 정상 3초 확정에 맡김
+          }
+        }
+      } else quietSince = null;
+
+      var stationary = quiet && Math.abs(vDet) < STILL_V;
       if(hasMoved && stationary){
         if(stillSince === null) stillSince = t;
         else if(t - stillSince >= STOP_HOLD_MS){ finishMeasurement(true); return; }
       } else {
         stillSince = null;
       }
+      // 운행 없이 방치되면 자동 취소(배터리·오작동 방지)
+      if(!hasMoved && (t - rideStartT) > IDLE_TIMEOUT_MS){ cancelMeasurement("운행이 감지되지 않아 측정을 취소했습니다."); return; }
     }
+  }
+
+  // 이벤트/센서 타임스탬프는 performance.now()와 같은 시간원점(DOMHighResTimeStamp)이면 그대로 쓰고,
+  // 그렇지 않으면(epoch ms 등) performance.now()로 폴백 — 두 시계가 섞여 dt가 깨지는 것을 방지.
+  function clock(raw){
+    var now = performance.now();
+    if(typeof raw === "number" && isFinite(raw) && raw > 0 && raw < now + 1e6) return raw;
+    return now;
   }
 
   function onMotion(e){
     var a = e.accelerationIncludingGravity;
     if(!a) return;
     activeSensor = "devicemotion";
-    recordSample(a.x, a.y, a.z, performance.now());
+    recordSample(a.x, a.y, a.z, clock(e.timeStamp));
   }
 
   function stopMotionSensor(){
@@ -307,7 +378,7 @@
         motionSensor.addEventListener("reading", function(){
           if(sensorFallbackTimer){ clearTimeout(sensorFallbackTimer); sensorFallbackTimer = null; }
           activeSensor = "accelerometer";
-          recordSample(motionSensor.x, motionSensor.y, motionSensor.z, performance.now());
+          recordSample(motionSensor.x, motionSensor.y, motionSensor.z, clock(motionSensor.timestamp));
         });
         motionSensor.addEventListener("error", function(){
           if(!recording || activeSensor === "devicemotion") return;
@@ -349,12 +420,39 @@
     }
   }
 
+  function requestWakeLock(){
+    if(!("wakeLock" in navigator)) return;
+    try {
+      navigator.wakeLock.request("screen").then(function(wl){ wakeLock = wl; }).catch(function(){});
+    } catch(e) {}
+  }
+  function releaseWakeLock(){
+    if(wakeLock){ try { wakeLock.release(); } catch(e) {} wakeLock = null; }
+  }
+  document.addEventListener("visibilitychange", function(){
+    if(recording && document.visibilityState === "visible") requestWakeLock();
+  });
+
+  function cancelMeasurement(msg){
+    if(!recording) return;
+    recording = false; phase = "idle";
+    stopMotionSensor(); releaseWakeLock();
+    if(ticker){ clearInterval(ticker); ticker = null; }
+    btn.textContent = "측정 시작"; btn.classList.remove("stop");
+    $("countdown").style.display = "none";
+    $("liveWrap").style.display = "none";
+    $("status").innerHTML = msg || "측정을 취소했습니다.";
+  }
+
   function start(){
     function begin(){
       recording = true; phase = "baseline";
       samples = []; baselineSamples = []; baseline = null;
-      vLive = 0; lastLive = null; recordStart = performance.now();
+      vDet = 0; biasA = 0; lastDetT = null; aDetPrev = 0;
+      moveAccSince = null; quietSince = null; sigmaBase = 0.03;
+      recordStart = performance.now(); rideStartT = 0;
       baseMag = null; stillSince = null; hasMoved = false; stillWindow = [];
+      requestWakeLock();
       $("results").classList.remove("show");
       $("liveWrap").style.display = "none";
       $("countdown").style.display = "block";
@@ -377,7 +475,8 @@
   function finishMeasurement(auto){
     if(!recording) return;
     recording = false;
-    stopMotionSensor();
+    stopMotionSensor(); releaseWakeLock();
+    if(auto && navigator.vibrate){ try { navigator.vibrate([100,50,100]); } catch(e) {} }
     if(ticker){ clearInterval(ticker); ticker = null; }
     phase = "idle";
     btn.textContent = "측정 시작"; btn.classList.remove("stop");
@@ -406,7 +505,7 @@
     $("dist").textContent = r.dist.toFixed(2) + " m";
     $("dur").textContent = r.duration.toFixed(1) + " s";
     var sensorLabel = r.sensor === "accelerometer" ? "고속" : "기본";
-    $("rate").textContent = (r.n / (r.duration||1)).toFixed(0) + " Hz · " + sensorLabel;
+    $("rate").textContent = (r.n / (r.fullSpan || r.duration || 1)).toFixed(0) + " Hz · " + sensorLabel;
     $("gmag").textContent = r.gmag.toFixed(2) + " m/s²";
 
     if(r.endDrift != null && r.cruise > 0){
@@ -599,7 +698,7 @@
     var hhmm = ("0"+d.getHours()).slice(-2)+":"+("0"+d.getMinutes()).slice(-2)+":"+("0"+d.getSeconds()).slice(-2);
     history.push({
       id: Date.now()+"_"+Math.floor(Math.random()*1e6), time:hhmm,
-      cruise:r.cruise, maxV:r.maxV, dist:r.dist, duration:r.duration,
+      cruise:r.cruise, maxV:r.maxV, dist:r.dist, duration:r.duration, fullSpan:r.fullSpan,
       gmag:r.gmag, n:r.n, cruiseStart:r.cruiseStart, cruiseEnd:r.cruiseEnd, endDrift:r.endDrift, sensor:r.sensor,
       vel: r.vel.map(function(p){ return { t:+p.t.toFixed(3), v:+p.v.toFixed(4) }; })
     });

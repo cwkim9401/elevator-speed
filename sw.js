@@ -2,7 +2,7 @@
    앱 셸을 캐시에 저장해 최초 1회 로드 후 오프라인(승강로 안)에서도 동작하게 한다.
    앱을 수정하면 아래 CACHE 버전을 올려라 (예: v23 -> v24). */
 const CACHE_PREFIX = "elevspeed-";
-const CACHE = `${CACHE_PREFIX}v24`;
+const CACHE = `${CACHE_PREFIX}v25`;
 const APP_SHELL = "./index.html";
 const ASSETS = [
   "./",
