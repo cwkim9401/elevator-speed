@@ -121,15 +121,16 @@
   var ACC_CRUISE = 0.20;   // 정속 판정: |수직가속도|가 이 값 미만이면 '가속 끝(정속)'으로 봄
   // 드리프트 방지: ACC_GATE(m/s^2) 미만 가속도는 0으로 취급(데드존).
   // V_FLOOR: 무가속이면서 속도가 이 값(m/s) 미만이면 0으로 클램프(정지 판정).
-  var ACC_GATE = 0.10, V_FLOOR = 0.15;
+  var ACC_GATE = 0.08, V_FLOOR = 0.10;
   // 자동 종료: 운행(속도>MOVED_TH)을 마친 뒤 정지(속도<STILL_V)가 STOP_HOLD_MS 지속되면 종료.
   // 기준 카운트다운 중 |가속도|가 MOVE_RESET_TH 넘게 변하면 움직임으로 보고 카운트 리셋.
-  var STOP_HOLD_MS = 3000, MOVE_RESET_TH = 0.6, MOVED_TH = 0.30, STILL_V = 0.20;
+  var STOP_HOLD_MS = 3000, MOVE_RESET_TH = 0.6, MOVED_TH = 0.25, STILL_V = 0.15;
+  var STILL_WINDOW_MS = 800, STILL_ACC_AVG = 0.12;
 
   var recording = false, phase = "idle";
   var samples = [], baselineSamples = [], baseline = null;
   var recordStart = 0, vLive = 0, lastLive = null, ticker = null, history = [];
-  var stillSince = null, hasMoved = false, baseMag = null;
+  var stillSince = null, hasMoved = false, baseMag = null, stillWindow = [];
   var motionSensor = null, sensorFallbackTimer = null, activeSensor = "devicemotion";
 
   var $ = function(id){ return document.getElementById(id); };
@@ -243,7 +244,7 @@
       if(elapsed >= BASELINE_MS){
         baseline = computeBaseline(baselineSamples);
         phase = "ride";
-        vLive = 0; hasMoved = false; stillSince = null;
+        vLive = 0; hasMoved = false; stillSince = null; stillWindow = [];
         var a0 = vertAccel(baseline, s);
         lastLive = { t:t, aVert: Math.abs(a0) < ACC_GATE ? 0 : a0 };
         $("countdown").style.display = "none";
@@ -258,8 +259,16 @@
       if(aVert === 0 && Math.abs(vLive) < V_FLOOR) vLive = 0; // 정지 클램프(무가속 & 최저속도 미만)
       lastLive = { t:t, aVert:aVert };
       if(Math.abs(vLive) > MOVED_TH) hasMoved = true;
-      // 운행을 마치고 다시 정지 상태가 STOP_HOLD_MS 지속되면 자동 종료
-      var stationary = (aVert === 0 && Math.abs(vLive) < STILL_V);
+      // 운행을 마치고 최근 짧은 구간까지 조용하면 정지로 본다. 순간값보다 진동/샘플 튐에 덜 흔들린다.
+      stillWindow.push({ t:t, a:Math.abs(aRaw) });
+      while(stillWindow.length && t-stillWindow[0].t > STILL_WINDOW_MS) stillWindow.shift();
+      var accSum = 0;
+      for(var wi=0; wi<stillWindow.length; wi++) accSum += stillWindow[wi].a;
+      var windowSpan = stillWindow.length ? t-stillWindow[0].t : 0;
+      var recentCalm = windowSpan >= STILL_WINDOW_MS*0.5 &&
+                       (accSum/Math.max(stillWindow.length,1)) < STILL_ACC_AVG;
+      if(recentCalm && Math.abs(vLive) < STILL_V) vLive = 0;
+      var stationary = (recentCalm && Math.abs(vLive) < STILL_V);
       if(hasMoved && stationary){
         if(stillSince === null) stillSince = t;
         else if(t - stillSince >= STOP_HOLD_MS){ finishMeasurement(true); return; }
@@ -345,7 +354,7 @@
       recording = true; phase = "baseline";
       samples = []; baselineSamples = []; baseline = null;
       vLive = 0; lastLive = null; recordStart = performance.now();
-      baseMag = null; stillSince = null; hasMoved = false;
+      baseMag = null; stillSince = null; hasMoved = false; stillWindow = [];
       $("results").classList.remove("show");
       $("liveWrap").style.display = "none";
       $("countdown").style.display = "block";
