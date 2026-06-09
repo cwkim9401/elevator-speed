@@ -117,6 +117,7 @@
 (function(){
   "use strict";
   var BASELINE_MS = 3000, SMOOTH_WIN = 13, PLATEAU_FRAC = 0.8;
+  var TARGET_SENSOR_HZ = 120; // 지원 기기에서는 Generic Sensor API로 이 주파수를 요청한다.
   var ACC_CRUISE = 0.20;   // 정속 판정: |수직가속도|가 이 값 미만이면 '가속 끝(정속)'으로 봄
   // 드리프트 방지: ACC_GATE(m/s^2) 미만 가속도는 0으로 취급(데드존).
   // V_FLOOR: 무가속이면서 속도가 이 값(m/s) 미만이면 0으로 클램프(정지 판정).
@@ -129,14 +130,15 @@
   var samples = [], baselineSamples = [], baseline = null;
   var recordStart = 0, vLive = 0, lastLive = null, ticker = null, history = [];
   var stillSince = null, hasMoved = false, baseMag = null;
+  var motionSensor = null, sensorFallbackTimer = null, activeSensor = "devicemotion";
 
   var $ = function(id){ return document.getElementById(id); };
   var btn = $("btn");
 
   function checkEnv(){
     var b = $("banner"); var msgs = [];
-    if (typeof DeviceMotionEvent === "undefined")
-      msgs.push("이 브라우저는 DeviceMotion(가속도 센서) API를 지원하지 않습니다.");
+    if (typeof DeviceMotionEvent === "undefined" && !("Accelerometer" in window))
+      msgs.push("이 브라우저는 가속도 센서 API를 지원하지 않습니다.");
     if (!window.isSecureContext)
       msgs.push("보안 컨텍스트가 아닙니다. 가속도 센서는 <b>HTTPS</b>(또는 localhost)에서만 동작합니다. https:// 주소로 접속하세요.");
     if (msgs.length){ b.innerHTML = msgs.join("<br>"); b.classList.add("show"); }
@@ -215,15 +217,13 @@
       disp += (vel[i].v + vel[i-1].v)/2 * dt;          // 부호 있는 변위 적분
     }
     var dist=Math.abs(disp);                            // 원점→도착 순이동(상승·하강 상쇄, 항상 양수)
-    return { cruise:cruise, maxV:maxV, dist:dist, duration:tE-tS, vel:vel, cruiseStart:cs, cruiseEnd:ce, gmag:base.gmag, n:samps.length, endDrift:Math.abs(vEnd) };
+    return { cruise:cruise, maxV:maxV, dist:dist, duration:tE-tS, vel:vel, cruiseStart:cs, cruiseEnd:ce, gmag:base.gmag, n:samps.length, endDrift:Math.abs(vEnd), sensor:activeSensor };
   }
 
-  function onMotion(e){
+  function recordSample(x, y, z, t){
     if(!recording) return;
-    var a = e.accelerationIncludingGravity;
-    if(!a || a.x == null) return;
-    var t = performance.now();
-    var s = { t:t, x:a.x, y:a.y, z:a.z };
+    if(x == null || y == null || z == null) return;
+    var s = { t:t, x:x, y:y, z:z };
     samples.push(s);
     var elapsed = t - recordStart;
 
@@ -265,6 +265,56 @@
     }
   }
 
+  function onMotion(e){
+    var a = e.accelerationIncludingGravity;
+    if(!a) return;
+    activeSensor = "devicemotion";
+    recordSample(a.x, a.y, a.z, performance.now());
+  }
+
+  function stopMotionSensor(){
+    window.removeEventListener("devicemotion", onMotion);
+    if(sensorFallbackTimer){ clearTimeout(sensorFallbackTimer); sensorFallbackTimer = null; }
+    if(motionSensor){
+      try { motionSensor.stop(); } catch(err) {}
+      motionSensor = null;
+    }
+  }
+
+  function startDeviceMotion(){
+    activeSensor = "devicemotion";
+    window.addEventListener("devicemotion", onMotion, { passive:true });
+  }
+
+  function startMotionSensor(){
+    activeSensor = "pending";
+    if(window.isSecureContext && "Accelerometer" in window){
+      try {
+        motionSensor = new window.Accelerometer({ frequency: TARGET_SENSOR_HZ });
+        motionSensor.addEventListener("reading", function(){
+          if(sensorFallbackTimer){ clearTimeout(sensorFallbackTimer); sensorFallbackTimer = null; }
+          activeSensor = "accelerometer";
+          recordSample(motionSensor.x, motionSensor.y, motionSensor.z, performance.now());
+        });
+        motionSensor.addEventListener("error", function(){
+          if(!recording || activeSensor === "devicemotion") return;
+          if(motionSensor){ try { motionSensor.stop(); } catch(err) {} motionSensor = null; }
+          startDeviceMotion();
+        });
+        motionSensor.start();
+        sensorFallbackTimer = setTimeout(function(){
+          if(!recording || samples.length) return;
+          if(motionSensor){ try { motionSensor.stop(); } catch(err) {} motionSensor = null; }
+          startDeviceMotion();
+        }, 900);
+        return;
+      } catch(err) {
+        if(motionSensor){ try { motionSensor.stop(); } catch(stopErr) {} motionSensor = null; }
+      }
+    }
+    startDeviceMotion();
+  }
+
   function uiTick(){
     if(!recording) return;
     var now = performance.now();
@@ -297,7 +347,7 @@
       $("countdown").style.display = "block";
       $("status").innerHTML = "기준 측정 중… <b>정지 상태</b>를 유지하세요";
       btn.textContent = "측정 종료"; btn.classList.add("stop");
-      window.addEventListener("devicemotion", onMotion);
+      startMotionSensor();
       ticker = setInterval(uiTick, 100);
     }
     if(typeof DeviceMotionEvent !== "undefined" &&
@@ -314,7 +364,7 @@
   function finishMeasurement(auto){
     if(!recording) return;
     recording = false;
-    window.removeEventListener("devicemotion", onMotion);
+    stopMotionSensor();
     if(ticker){ clearInterval(ticker); ticker = null; }
     phase = "idle";
     btn.textContent = "측정 시작"; btn.classList.remove("stop");
@@ -342,7 +392,8 @@
     $("maxMpm").textContent = (r.maxV*60).toFixed(1) + " m/min";
     $("dist").textContent = r.dist.toFixed(2) + " m";
     $("dur").textContent = r.duration.toFixed(1) + " s";
-    $("rate").textContent = (r.n / (r.duration||1)).toFixed(0) + " Hz";
+    var sensorLabel = r.sensor === "accelerometer" ? "고속" : "기본";
+    $("rate").textContent = (r.n / (r.duration||1)).toFixed(0) + " Hz · " + sensorLabel;
     $("gmag").textContent = r.gmag.toFixed(2) + " m/s²";
 
     if(r.endDrift != null && r.cruise > 0){
@@ -536,7 +587,7 @@
     history.push({
       id: Date.now()+"_"+Math.floor(Math.random()*1e6), time:hhmm,
       cruise:r.cruise, maxV:r.maxV, dist:r.dist, duration:r.duration,
-      gmag:r.gmag, n:r.n, cruiseStart:r.cruiseStart, cruiseEnd:r.cruiseEnd, endDrift:r.endDrift,
+      gmag:r.gmag, n:r.n, cruiseStart:r.cruiseStart, cruiseEnd:r.cruiseEnd, endDrift:r.endDrift, sensor:r.sensor,
       vel: r.vel.map(function(p){ return { t:+p.t.toFixed(3), v:+p.v.toFixed(4) }; })
     });
     saveHistory();
