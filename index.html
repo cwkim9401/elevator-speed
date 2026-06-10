@@ -24,6 +24,14 @@
   .live { text-align:center; margin:10px 0; }
   .live .big { font-size:64px; font-weight:800; line-height:1; letter-spacing:-1px; }
   .live .unit { font-size:18px; color:var(--muted); }
+  .liveRow { display:flex; gap:10px; margin-top:6px; text-align:left; }
+  .liveCell { flex:1; background:#11151c; border:1px solid var(--line); border-radius:10px; padding:10px; }
+  .liveCell .k { font-size:12px; color:var(--muted); }
+  .liveCell .k .ref { color:#f0c674; font-weight:700; }
+  .liveNum { font-size:29px; font-weight:800; line-height:1.15; margin-top:2px; letter-spacing:-0.5px; }
+  .liveNum .u { font-size:13px; font-weight:600; color:var(--muted); letter-spacing:0; }
+  .liveSub { font-size:12px; color:var(--muted); margin-top:2px; }
+  .liveCap { font-size:11.5px; color:var(--muted); margin-top:8px; line-height:1.5; text-align:left; }
   .countdown { font-size:64px; font-weight:800; color:var(--accent); text-align:center; }
   button.main { width:100%; font-size:24px; font-weight:800; padding:22px; border:none; border-radius:14px; color:#06210f; background:var(--accent); }
   button.main.stop { background:var(--danger); color:#2a0808; }
@@ -62,8 +70,20 @@
   <div class="card">
     <div id="status" class="status">버튼을 누른 뒤 <b>3초간 정지 상태</b>를 유지하세요.</div>
     <div id="liveWrap" class="live" style="display:none">
-      <div class="big" style="font-size:46px">측정 중<span id="dots">.</span></div>
-      <div class="unit" style="font-size:13px; margin-top:8px">운행 후 멈추면 자동으로 결과가 나옵니다</div>
+      <div class="liveRow">
+        <div class="liveCell">
+          <div class="k">실시간 속도 <span class="ref">참고용</span></div>
+          <div class="liveNum"><span id="liveDir"></span><span id="liveV">0.0</span><span class="u"> m/min</span></div>
+          <div class="liveSub"><span id="liveVms">0.00</span> m/s</div>
+        </div>
+        <div class="liveCell">
+          <div class="k">이번 운행 최고</div>
+          <div class="liveNum"><span id="liveMax">0.0</span><span class="u"> m/min</span></div>
+          <div class="liveSub">수직 가속도 <span id="liveA">+0.00</span> m/s²</div>
+        </div>
+      </div>
+      <canvas id="liveCv" width="600" height="170"></canvas>
+      <div class="liveCap"><span style="color:#36d399">━ 속도</span> · <span style="color:#6ea8fe">━ 가속도</span> — 실시간 추정(참고용)입니다. 끝점 드리프트 보정은 운행 종료 후에만 가능하므로 최종값은 결과 화면 기준.</div>
     </div>
     <div id="countdown" class="countdown" style="display:none"></div>
   </div>
@@ -148,6 +168,7 @@
   var RESCUE_QUIET_MS = 6000, RESCUE_V = 0.25;
   var RESCUE_HARD_MS = 30000, RESCUE_HARD_V = 1.0;
   var IDLE_TIMEOUT_MS = 120000; // 운행 없이 방치되면 자동 취소
+  var LIVE_SPAN_MS = 12000;     // 라이브 그래프 표시 구간(ms)
 
   var recording = false, phase = "idle";
   var samples = [], baselineSamples = [], baseline = null;
@@ -158,6 +179,8 @@
   var moveAccSince = null, quietSince = null, sigmaBase = 0.03;
   var motionSensor = null, sensorFallbackTimer = null, activeSensor = "devicemotion";
   var wakeLock = null;
+  // 라이브 표시(그래프·숫자) 전용 상태 — 검출 로직과 분리, 표시에만 사용
+  var liveBuf = [], liveMaxV = 0, liveAEma = 0, liveRaf = null, liveLastTxt = 0;
 
   var $ = function(id){ return document.getElementById(id); };
   var btn = $("btn");
@@ -357,6 +380,12 @@
         }
       } else quietSince = null;
 
+      // 라이브 표시 버퍼(표시 전용 — 검출 로직에는 영향 없음)
+      liveAEma += 0.25 * (aCorr - liveAEma);                  // 표시용 가속도 살짝 평활(~60ms)
+      liveBuf.push({ t:t, a:liveAEma, v:vDet });
+      while(liveBuf.length && t - liveBuf[0].t > LIVE_SPAN_MS) liveBuf.shift();
+      if(hasMoved && Math.abs(vDet) > liveMaxV) liveMaxV = Math.abs(vDet);
+
       var stationary = quiet && Math.abs(vDet) < STILL_V;
       if(hasMoved && stationary){
         if(stillSince === null) stillSince = t;
@@ -437,8 +466,8 @@
       $("countdown").textContent = (left>0?left:1);
       $("status").textContent = "기준 측정 중… 정지 상태를 유지하세요";
     } else if(phase === "ride"){
-      var nd = (Math.floor(now/400) % 3) + 1;            // 점 1→2→3 반복(측정 중 표시)
-      $("dots").textContent = new Array(nd+1).join(".");
+      if(liveRaf === null && typeof requestAnimationFrame === "function")
+        liveRaf = requestAnimationFrame(liveLoop);          // 라이브 그래프 루프 기동(종료 시 자가 정지)
       if(hasMoved && stillSince !== null){
         var rem = Math.ceil((STOP_HOLD_MS - (now - stillSince))/1000);
         $("status").innerHTML = "정지 감지 — <b>" + (rem>0?rem:1) + "초</b> 후 자동 종료";
@@ -446,6 +475,68 @@
         $("status").innerHTML = "운행 중… 도착 후 멈추면 <b>자동 종료</b>됩니다";
       }
     }
+  }
+
+  // ── 라이브 그래프(표시 전용) ──────────────────────────────────────────────
+  // 가속도는 적분이 없어 드리프트가 없는 신뢰 가능한 신호이고,
+  // 속도는 라이브 채널(감도보정+온라인 바이어스+ZUPT) 추정치 = 참고용.
+  function liveLoop(ts){
+    if(!(recording && phase === "ride")){ liveRaf = null; return; }
+    drawLive(typeof ts === "number" ? ts : performance.now());
+    liveRaf = requestAnimationFrame(liveLoop);
+  }
+
+  function liveAvg(field, ms){   // 버퍼 끝에서 ms 구간 평균(표시 숫자 떨림 방지)
+    if(!liveBuf.length) return 0;
+    var tEnd = liveBuf[liveBuf.length-1].t, sum = 0, c = 0, i;
+    for(i = liveBuf.length-1; i >= 0 && tEnd - liveBuf[i].t <= ms; i--){ sum += liveBuf[i][field]; c++; }
+    return c ? sum/c : 0;
+  }
+
+  function drawLive(now){
+    var cv = $("liveCv");
+    if(!cv || !liveBuf.length) return;
+    if(now - liveLastTxt > 150){                            // 숫자는 ~7Hz로만 갱신
+      liveLastTxt = now;
+      var v = liveAvg("v", 250), a = liveAvg("a", 150);
+      $("liveDir").textContent = v > 0.05 ? "▲ " : (v < -0.05 ? "▼ " : "");
+      $("liveV").textContent = (Math.abs(v)*60).toFixed(1);
+      $("liveVms").textContent = Math.abs(v).toFixed(2);
+      $("liveMax").textContent = (liveMaxV*60).toFixed(1);
+      $("liveA").textContent = (a >= 0 ? "+" : "") + a.toFixed(2);
+    }
+    var ctx = cv.getContext("2d");
+    var W = cv.width, H = cv.height, PAD = 8;
+    ctx.clearRect(0, 0, W, H);
+    var tEnd = liveBuf[liveBuf.length-1].t, t0 = tEnd - LIVE_SPAN_MS;
+    var aM = 1.0, vM = 0.5, i, p;                            // 최소 스케일: ±1 m/s², ±0.5 m/s
+    for(i=0;i<liveBuf.length;i++){
+      p = liveBuf[i];
+      if(Math.abs(p.a) > aM) aM = Math.abs(p.a);
+      if(Math.abs(p.v) > vM) vM = Math.abs(p.v);
+    }
+    aM *= 1.15; vM *= 1.15;
+    var mid = H/2, amp = mid - PAD;
+    var X = function(t){ return (t - t0) / LIVE_SPAN_MS * W; };
+    ctx.strokeStyle = "#2b323f"; ctx.lineWidth = 1;          // 0선
+    ctx.beginPath(); ctx.moveTo(0, mid); ctx.lineTo(W, mid); ctx.stroke();
+    ctx.strokeStyle = "#6ea8fe"; ctx.lineWidth = 1.4;        // 가속도(가는 선)
+    ctx.beginPath();
+    for(i=0;i<liveBuf.length;i++){
+      p = liveBuf[i];
+      if(i) ctx.lineTo(X(p.t), mid - (p.a/aM)*amp); else ctx.moveTo(X(p.t), mid - (p.a/aM)*amp);
+    }
+    ctx.stroke();
+    ctx.strokeStyle = "#36d399"; ctx.lineWidth = 2.5;        // 속도(굵은 선, 위=상승)
+    ctx.beginPath();
+    for(i=0;i<liveBuf.length;i++){
+      p = liveBuf[i];
+      if(i) ctx.lineTo(X(p.t), mid - (p.v/vM)*amp); else ctx.moveTo(X(p.t), mid - (p.v/vM)*amp);
+    }
+    ctx.stroke();
+    ctx.fillStyle = "#8b949e"; ctx.font = "11px -apple-system, sans-serif";
+    ctx.textAlign = "left";  ctx.fillText("±" + (vM*60).toFixed(0) + " m/min", 6, 14);
+    ctx.textAlign = "right"; ctx.fillText("±" + aM.toFixed(1) + " m/s²", W-6, 14);
   }
 
   function requestWakeLock(){
@@ -480,6 +571,7 @@
       moveAccSince = null; quietSince = null; sigmaBase = 0.03;
       recordStart = performance.now(); rideStartT = 0;
       baseMag = null; stillSince = null; hasMoved = false; stillWindow = [];
+      liveBuf = []; liveMaxV = 0; liveAEma = 0; liveLastTxt = 0;
       requestWakeLock();
       $("results").classList.remove("show");
       $("liveWrap").style.display = "none";
