@@ -58,12 +58,17 @@
   .row { display:flex; gap:8px; }
   button.sec { flex:1; font-size:14px; padding:10px; border-radius:9px; border:1px solid var(--line); background:#11151c; color:var(--txt); }
   button.sec.active { border-color:var(--accent); color:var(--accent); }
-  button.install { width:100%; margin-top:10px; font-size:16px; font-weight:700; padding:14px; border-radius:11px; border:1px solid var(--accent); background:transparent; color:var(--accent); display:none; }
+  .topbar { display:flex; align-items:center; gap:10px; margin:4px 0 12px; }
+  .topbar h1 { flex:1; margin:0; }
+  button.topInstall { font-size:13px; font-weight:700; padding:9px 12px; border-radius:10px; border:1px solid var(--accent); background:transparent; color:var(--accent); white-space:nowrap; }
   .note { font-size:12px; color:var(--muted); line-height:1.5; }
 </style>
 </head>
 <body>
-  <h1>엘리베이터 속도 측정기</h1>
+  <div class="topbar">
+    <h1>엘리베이터 속도 측정기</h1>
+    <button id="installTop" class="topInstall">📲 홈 화면 추가</button>
+  </div>
 
   <div id="banner" class="banner"></div>
 
@@ -82,15 +87,15 @@
           <div class="liveSub">수직 가속도 <span id="liveA">+0.00</span> m/s²</div>
         </div>
       </div>
-      <canvas id="liveCv" width="600" height="170"></canvas>
-      <div class="liveCap"><span style="color:#36d399">━ 속도</span> · <span style="color:#6ea8fe">━ 가속도</span> — 실시간 추정(참고용)입니다. 끝점 드리프트 보정은 운행 종료 후에만 가능하므로 최종값은 결과 화면 기준.</div>
+      <canvas id="liveCvV" width="600" height="130"></canvas>
+      <canvas id="liveCvA" width="600" height="100"></canvas>
+      <div class="liveCap">속도는 실시간 추정(참고용) — 끝점 드리프트 보정은 운행 종료 후에만 가능하므로 최종값은 결과 화면 기준입니다.</div>
     </div>
     <div id="countdown" class="countdown" style="display:none"></div>
   </div>
 
   <div class="card">
     <button id="btn" class="main">측정 시작</button>
-    <button id="install" class="install">홈 화면에 앱 설치</button>
   </div>
 
   <div id="results" class="card results">
@@ -494,8 +499,8 @@
   }
 
   function drawLive(now){
-    var cv = $("liveCv");
-    if(!cv || !liveBuf.length) return;
+    var cvV = $("liveCvV"), cvA = $("liveCvA");
+    if(!cvV || !cvA || !liveBuf.length) return;
     if(now - liveLastTxt > 150){                            // 숫자는 ~7Hz로만 갱신
       liveLastTxt = now;
       var v = liveAvg("v", 250), a = liveAvg("a", 150);
@@ -505,10 +510,6 @@
       $("liveMax").textContent = (liveMaxV*60).toFixed(1);
       $("liveA").textContent = (a >= 0 ? "+" : "") + a.toFixed(2);
     }
-    var ctx = cv.getContext("2d");
-    var W = cv.width, H = cv.height, PAD = 8;
-    ctx.clearRect(0, 0, W, H);
-    var tEnd = liveBuf[liveBuf.length-1].t, t0 = tEnd - LIVE_SPAN_MS;
     var aM = 1.0, vM = 0.5, i, p;                            // 최소 스케일: ±1 m/s², ±0.5 m/s
     for(i=0;i<liveBuf.length;i++){
       p = liveBuf[i];
@@ -516,27 +517,28 @@
       if(Math.abs(p.v) > vM) vM = Math.abs(p.v);
     }
     aM *= 1.15; vM *= 1.15;
+    drawLiveTrace(cvV, "v", vM, "#36d399", 2.5, "속도 ±" + (vM*60).toFixed(0) + " m/min (위=상승)");
+    drawLiveTrace(cvA, "a", aM, "#6ea8fe", 1.6, "수직 가속도 ±" + aM.toFixed(1) + " m/s²");
+  }
+
+  function drawLiveTrace(cv, field, maxVal, color, lw, label){
+    var ctx = cv.getContext("2d");
+    var W = cv.width, H = cv.height, PAD = 8;
+    ctx.clearRect(0, 0, W, H);
+    var tEnd = liveBuf[liveBuf.length-1].t, t0 = tEnd - LIVE_SPAN_MS;
     var mid = H/2, amp = mid - PAD;
     var X = function(t){ return (t - t0) / LIVE_SPAN_MS * W; };
     ctx.strokeStyle = "#2b323f"; ctx.lineWidth = 1;          // 0선
     ctx.beginPath(); ctx.moveTo(0, mid); ctx.lineTo(W, mid); ctx.stroke();
-    ctx.strokeStyle = "#6ea8fe"; ctx.lineWidth = 1.4;        // 가속도(가는 선)
+    ctx.strokeStyle = color; ctx.lineWidth = lw;
     ctx.beginPath();
-    for(i=0;i<liveBuf.length;i++){
-      p = liveBuf[i];
-      if(i) ctx.lineTo(X(p.t), mid - (p.a/aM)*amp); else ctx.moveTo(X(p.t), mid - (p.a/aM)*amp);
-    }
-    ctx.stroke();
-    ctx.strokeStyle = "#36d399"; ctx.lineWidth = 2.5;        // 속도(굵은 선, 위=상승)
-    ctx.beginPath();
-    for(i=0;i<liveBuf.length;i++){
-      p = liveBuf[i];
-      if(i) ctx.lineTo(X(p.t), mid - (p.v/vM)*amp); else ctx.moveTo(X(p.t), mid - (p.v/vM)*amp);
+    for(var i=0;i<liveBuf.length;i++){
+      var p = liveBuf[i], x = X(p.t), y = mid - (p[field]/maxVal)*amp;
+      if(i) ctx.lineTo(x, y); else ctx.moveTo(x, y);
     }
     ctx.stroke();
     ctx.fillStyle = "#8b949e"; ctx.font = "11px -apple-system, sans-serif";
-    ctx.textAlign = "left";  ctx.fillText("±" + (vM*60).toFixed(0) + " m/min", 6, 14);
-    ctx.textAlign = "right"; ctx.fillText("±" + aM.toFixed(1) + " m/s²", W-6, 14);
+    ctx.textAlign = "left"; ctx.fillText(label, 6, 14);
   }
 
   function requestWakeLock(){
@@ -839,7 +841,7 @@
   function renderHistory(){
     if(!history.length){ $("histCard").style.display = "none"; return; }
     $("histCard").style.display = "block";
-    var rows = history.map(function(h){
+    var rows = history.slice().reverse().map(function(h){   // 최신 기록이 맨 위로
       return "<tr data-id='"+h.id+"' style='cursor:pointer'><td>"+h.time+"</td><td>"+(h.cruise).toFixed(4)+
              "</td><td>"+h.dist.toFixed(2)+"</td><td>"+h.duration.toFixed(1)+
              "</td><td style='text-align:center'><button class='del' data-id='"+h.id+"' style='background:none;border:none;color:var(--danger);font-size:16px;line-height:1;padding:2px 6px'>✕</button></td></tr>";
@@ -876,17 +878,50 @@ if ("serviceWorker" in navigator) {
 }
 (function(){
   var deferred = null;
-  var instBtn = document.getElementById("install");
+  var instBtn = document.getElementById("installTop");
+  var banner = document.getElementById("banner");
+  function isStandalone(){
+    return (window.matchMedia && matchMedia("(display-mode: standalone)").matches) ||
+           window.navigator.standalone === true;          // iOS 구형 표기
+  }
+  function hideBtn(){ if (instBtn) instBtn.style.display = "none"; }
+  if (isStandalone()) hideBtn();                          // 이미 앱으로 실행 중이면 버튼 불필요
+
   window.addEventListener("beforeinstallprompt", function(e){
-    e.preventDefault(); deferred = e;
-    if (instBtn) instBtn.style.display = "block";
+    e.preventDefault(); deferred = e;                     // 버튼은 항상 보이므로 프롬프트만 보관
   });
+
   if (instBtn) instBtn.addEventListener("click", function(){
-    if (!deferred) return;
-    deferred.prompt();
-    deferred.userChoice.then(function(){ deferred = null; instBtn.style.display = "none"; });
+    if (deferred){                                        // 네이티브 설치 프롬프트 가능
+      deferred.prompt();
+      deferred.userChoice.then(function(res){
+        deferred = null;
+        if (res && res.outcome === "accepted") hideBtn();
+      }).catch(function(){ deferred = null; });
+      return;
+    }
+    // 프롬프트가 없는 환경(iOS, 일부 브라우저, 이미 설치됨 등) → 수동 추가 안내
+    if (!banner) return;
+    banner.innerHTML =
+      "<b>홈 화면에 추가하면 데이터(인터넷) 없이도 작동합니다</b> — 승강로·지하에서도 사용 가능." +
+      "<br>· <b>Chrome</b>: 우측 상단 ⋮ 메뉴 → <b>홈 화면에 추가</b>(또는 '앱 설치')" +
+      "<br>· <b>삼성 인터넷</b>: ≡ 메뉴 → <b>현재 페이지 추가</b> → 홈 화면" +
+      "<br>· <b>iPhone Safari</b>: 공유 버튼 → <b>홈 화면에 추가</b>" +
+      "<br>이미 설치했다면 홈 화면의 <b>엘베속도</b> 아이콘으로 실행하세요." +
+      " 설치 후 <b>한 번만 온라인으로 실행</b>해 두면 이후엔 오프라인에서도 열립니다." +
+      " <span style='opacity:.75'>(이 안내를 누르면 닫힘)</span>";
+    banner.classList.add("show");
   });
-  window.addEventListener("appinstalled", function(){ if (instBtn) instBtn.style.display = "none"; });
+
+  if (banner) banner.addEventListener("click", function(){ banner.classList.remove("show"); });
+
+  window.addEventListener("appinstalled", function(){
+    hideBtn();
+    if (banner){
+      banner.innerHTML = "✅ 홈 화면에 설치되었습니다. 앱 데이터는 이미 저장되어 이제 <b>데이터 없이도</b>(승강로 안에서도) 작동합니다. <span style='opacity:.75'>(누르면 닫힘)</span>";
+      banner.classList.add("show");
+    }
+  });
 })();
 </script>
 </body>
