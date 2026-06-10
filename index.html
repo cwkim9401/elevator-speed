@@ -117,6 +117,7 @@
 (function(){
   "use strict";
   var BASELINE_MS = 3000, SMOOTH_MS = 250, PLATEAU_FRAC = 0.8;
+  var G_REF = 9.799;       // 지역 중력(한국 중부 위도 실측치). 기기 감도(스케일) 보정의 기준값.
   var TARGET_SENSOR_HZ = 120; // 지원 기기에서는 Generic Sensor API로 이 주파수를 요청한다.
   var ACC_CRUISE = 0.20;   // 정속 판정: |수직가속도|가 이 값 미만이면 '가속 끝(정속)'으로 봄
   var BASELINE_TRIM_MS = 400;  // 시작 직후(탭 진동) 구간은 기준 평균에서 제외
@@ -167,9 +168,13 @@
     for (i=0;i<samps.length;i++){ sx+=samps[i].x; sy+=samps[i].y; sz+=samps[i].z; }
     var gx=sx/n, gy=sy/n, gz=sz/n;
     var gmag=Math.hypot(gx,gy,gz)||1;
-    return { gh:{x:gx/gmag,y:gy/gmag,z:gz/gmag}, gmag:gmag };
+    // 감도(스케일) 보정계수: 측정한 중력 크기를 지역 중력 G_REF로 정규화.
+    // 기기별 감도 오차(0.5~3%)는 바이어스 보정으로 안 잡히고 속도·거리에 그대로 비례하므로 1차 보정.
+    // 기준 중력이 비정상 범위면(기준 오염·센서 이상) 보정하지 않는다.
+    var k = (gmag > 9.5 && gmag < 10.1) ? G_REF/gmag : 1;
+    return { gh:{x:gx/gmag,y:gy/gmag,z:gz/gmag}, gmag:gmag, k:k };
   }
-  function vertAccel(b, s){ return s.x*b.gh.x + s.y*b.gh.y + s.z*b.gh.z - b.gmag; }
+  function vertAccel(b, s){ return (s.x*b.gh.x + s.y*b.gh.y + s.z*b.gh.z - b.gmag) * b.k; }
   // 기준 구간 수직가속도의 표준편차(센서/거치 노이즈 바닥). 적응형 임계의 기준값.
   function baselineSigma(b, samps){
     var n = samps.length, i, a, s1 = 0, s2 = 0;
@@ -253,7 +258,16 @@
     for(i=0;i<vel.length;i++){ if(absV[i] > STILL_V){ if(mvFirst<0) mvFirst=i; mvLast=i; } }
     var fullSpan = tE - tS;
     var moveDur = (mvFirst>=0 && mvLast>mvFirst) ? (vel[mvLast].t - vel[mvFirst].t) : fullSpan;
-    return { cruise:cruise, maxV:maxV, dist:dist, duration:moveDur, fullSpan:fullSpan, vel:vel, cruiseStart:cs, cruiseEnd:ce, gmag:base.gmag, n:rideSamps.length, endDrift:Math.abs(vEnd), sensor:activeSensor };
+    // 자세 변화 점검: 운행 끝 1.5초(자동종료면 정지 구간)의 중력 방향 vs 기준 방향 각도.
+    // 수직 가감속은 중력과 같은 축이라 평균 벡터의 '방향'을 거의 안 바꾸므로, 각도 변화 ≈ 실제 기기 회전.
+    var tiltDeg = null, lastT = rideSamps[rideSamps.length-1].t;
+    var tailSamps = rideSamps.filter(function(s){ return lastT - s.t <= 1500; });
+    if(tailSamps.length > 10){
+      var eb = computeBaseline(tailSamps);
+      var edot = Math.min(1, Math.max(-1, base.gh.x*eb.gh.x + base.gh.y*eb.gh.y + base.gh.z*eb.gh.z));
+      tiltDeg = Math.acos(edot)*180/Math.PI;
+    }
+    return { cruise:cruise, maxV:maxV, dist:dist, duration:moveDur, fullSpan:fullSpan, vel:vel, cruiseStart:cs, cruiseEnd:ce, gmag:base.gmag, n:rideSamps.length, endDrift:Math.abs(vEnd), sensor:activeSensor, tiltDeg:tiltDeg, scaleK:base.k };
   }
 
   function recordSample(x, y, z, t){
@@ -261,6 +275,7 @@
     if(x == null || y == null || z == null) return;
     var s = { t:t, x:x, y:y, z:z };
     samples.push(s);
+    if(samples.length === 1) recordStart = t;  // 센서 기동이 늦어도(폴백 등) 기준 3초를 첫 샘플부터 온전히 확보
     var elapsed = t - recordStart;
 
     if(phase === "baseline"){
@@ -506,13 +521,23 @@
     $("dur").textContent = r.duration.toFixed(1) + " s";
     var sensorLabel = r.sensor === "accelerometer" ? "고속" : "기본";
     $("rate").textContent = (r.n / (r.fullSpan || r.duration || 1)).toFixed(0) + " Hz · " + sensorLabel;
-    $("gmag").textContent = r.gmag.toFixed(2) + " m/s²";
+    var gOk = r.gmag > 9.5 && r.gmag < 10.1;
+    var gTxt = r.gmag.toFixed(2) + " m/s²";
+    if(r.scaleK != null && gOk) gTxt += " <span style='font-size:12px;color:var(--muted)'>·×" + r.scaleK.toFixed(3) + "</span>";
+    $("gmag").innerHTML = gTxt;
+    $("gmag").classList.toggle("err", !gOk);
 
+    var warns = [];
+    if(r.tiltDeg != null && r.tiltDeg >= 2)
+      warns.push("⚠ 기기 자세 변화 " + r.tiltDeg.toFixed(1) + "° — 측정 중 기기가 움직였을 수 있어 신뢰도가 낮습니다");
+    if(!gOk)
+      warns.push("⚠ 기준 중력 비정상 — 기준 측정 오염 또는 센서 이상 의심 (감도 보정 미적용)");
+    var warnHtml = warns.length ? "<br><span style='color:var(--danger)'>" + warns.join("<br>") + "</span>" : "";
     if(r.endDrift != null && r.cruise > 0){
       var ratio = r.endDrift/Math.max(r.cruise,0.1);
       var q = ratio < 0.15 ? "높음" : (ratio < 0.4 ? "보통" : "낮음");
-      $("qualTag").innerHTML = "측정 안정도: <b>"+q+"</b> (드리프트 "+(r.endDrift*60).toFixed(1)+" m/min)";
-    } else { $("qualTag").textContent = "측정 안정도: –"; }
+      $("qualTag").innerHTML = "측정 안정도: <b>"+q+"</b> (드리프트 "+(r.endDrift*60).toFixed(1)+" m/min)" + warnHtml;
+    } else { $("qualTag").innerHTML = "측정 안정도: –" + warnHtml; }
     $("results").classList.add("show");
     drawChart(r);
   }
@@ -700,6 +725,7 @@
       id: Date.now()+"_"+Math.floor(Math.random()*1e6), time:hhmm,
       cruise:r.cruise, maxV:r.maxV, dist:r.dist, duration:r.duration, fullSpan:r.fullSpan,
       gmag:r.gmag, n:r.n, cruiseStart:r.cruiseStart, cruiseEnd:r.cruiseEnd, endDrift:r.endDrift, sensor:r.sensor,
+      tiltDeg:(r.tiltDeg == null ? null : +r.tiltDeg.toFixed(2)), scaleK:(r.scaleK == null ? null : +r.scaleK.toFixed(4)),
       vel: r.vel.map(function(p){ return { t:+p.t.toFixed(3), v:+p.v.toFixed(4) }; })
     });
     saveHistory();
