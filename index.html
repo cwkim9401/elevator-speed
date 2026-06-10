@@ -133,11 +133,20 @@
   var MOVE_ACC_TH = 0.35, MOVE_ACC_MS = 400; // 느린 크리프 대비: 가속도 지속으로도 운행 시작 판정
   var STILL_V = 0.15;          // ZUPT/정지 판정 속도 임계
   var STILL_WINDOW_MS = 800;   // 정지 판정 슬라이딩 윈도 길이
-  var QUIET_SD = 0.22;         // 윈도 표준편차가 이 값 미만이면 '조용함'(바이어스 영향 없음)
+  var QUIET_SD = 0.22;         // 윈도 표준편차가 이 값 미만이면 '진동 없음'
+  var QUIET_MEAN = 0.12;       // 보정 후 윈도 '평균' |가속도|가 이 값 미만이어야 '조용함'.
+                               // 표준편차만 보면 부드러운 등가속 램프(평균≠0, 편차≈0)가 조용함으로 오인되어
+                               // ZUPT가 vDet를 계속 0으로 눌러 출발 직후 정지로 판정→자동종료되는 버그가 있었음.
   var BIAS_TAU = 2.0;          // 바이어스 EMA 시정수(초)
   var BIAS_GATE = 0.12;        // |윈도평균-현재바이어스|가 이 값 미만일 때만 바이어스 갱신(램프 제외)
-  // 폴백(레스큐): 장시간 '엄격 조용' 지속 시 정지로 확정해 고착/틸트에서 회복
-  var RESCUE_QUIET_MS = 6000, RESCUE_HARD_MS = 12000, RESCUE_V = 0.6;
+  // 폴백(레스큐): 장시간 '엄격 조용' 지속 시 정지로 확정해 고착/틸트에서 회복.
+  // 주의: 정속 순항도 가속도만으론 '엄격 조용'과 구분이 안 된다. 순항을 정지로 오인해 운행 중
+  // 조기종료하면 결과가 통째로 틀어지므로(무증상 오류) 임계를 보수적으로 잡는다:
+  //  - RESCUE_V: 최저 정격속도(0.5 m/s) 카의 라이브 추정치(램프 초기 ZUPT 손실로 실제보다 낮음)보다 충분히 낮게
+  //  - HARD: 통상 순항 시간보다 길게 + RESCUE_HARD_V 미만일 때만 (1.0 m/s 이상 순항은 절대 오인 안 함)
+  // 고착이 더 심한 경우는 자동종료를 포기하고 수동 종료에 맡긴다(정지 후 수동 종료는 후처리가 정확함).
+  var RESCUE_QUIET_MS = 6000, RESCUE_V = 0.25;
+  var RESCUE_HARD_MS = 30000, RESCUE_HARD_V = 1.0;
   var IDLE_TIMEOUT_MS = 120000; // 운행 없이 방치되면 자동 취소
 
   var recording = false, phase = "idle";
@@ -315,15 +324,19 @@
       var wSd = n ? Math.sqrt(Math.max(0, s2/n - wMean*wMean)) : 0;
       var windowSpan = n ? t-stillWindow[0].t : 0;
       var ready = windowSpan >= STILL_WINDOW_MS*0.5;
-      var quiet = ready && wSd < QUIET_SD;
+      // '조용함' = 진동(표준편차)이 작고 + 보정 후 '평균' 가속도도 0 근처(정지·정속의 공통 신호).
+      // 평균 조건이 없으면 일정한 가속(등가속 램프)이 조용함으로 분류되어 출발 직후 정지로 오판된다.
+      var quiet = ready && wSd < QUIET_SD && Math.abs(wMean - biasA) < QUIET_MEAN;
 
       // 온라인 바이어스 보정: 조용하고 윈도평균이 현재 바이어스와 가까울 때만(램프 배제)
       if(quiet && Math.abs(wMean - biasA) < BIAS_GATE){
         var alpha = Math.min(1, dt / BIAS_TAU);
         biasA += alpha * (wMean - biasA);
       }
-      // ZUPT: 조용하고 속도가 낮으면 0으로 고정(고착 없이 0으로 복귀)
-      if(quiet && Math.abs(vDet) < STILL_V) vDet = 0;
+      // ZUPT: 조용함 + '지금' 가속도도 작을 때만 0 고정.
+      // 윈도 평균(quiet)은 ~0.4s 지연되므로, 완만한 가감속이 ±STILL_V 대역을 지나는 순간을
+      // 순간 가속도(aCorr)로 걸러내지 않으면 통과 중에 속도가 깎여 라이브 추정이 손실된다.
+      if(quiet && Math.abs(aCorr) < QUIET_MEAN && Math.abs(vDet) < STILL_V) vDet = 0;
 
       // 운행 시작 판정: 속도 임계 또는 지속 가속도(느린 크리프 대비)
       if(Math.abs(vDet) > MOVED_TH) hasMoved = true;
@@ -338,7 +351,7 @@
         if(quietSince === null) quietSince = t;
         else {
           var qd = t - quietSince;
-          if(hasMoved && ((qd >= RESCUE_QUIET_MS && Math.abs(vDet) < RESCUE_V) || qd >= RESCUE_HARD_MS)){
+          if(hasMoved && ((qd >= RESCUE_QUIET_MS && Math.abs(vDet) < RESCUE_V) || (qd >= RESCUE_HARD_MS && Math.abs(vDet) < RESCUE_HARD_V))){
             vDet = 0; biasA = wMean; quietSince = t;   // 0으로 재설정 후 정상 3초 확정에 맡김
           }
         }
