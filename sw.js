@@ -1,8 +1,8 @@
 /* 엘리베이터 속도 측정기 - 오프라인 서비스워커
    앱 셸을 캐시에 저장해 최초 1회 로드 후 오프라인(승강로 안)에서도 동작하게 한다.
-   앱을 수정하면 아래 CACHE 버전을 올려라 (예: v32 -> v33). */
+   앱을 수정하면 아래 CACHE 버전을 올려라 (예: v33 -> v34). */
 const CACHE_PREFIX = "elevspeed-";
-const CACHE = `${CACHE_PREFIX}v32`;
+const CACHE = `${CACHE_PREFIX}v33`;
 const NAV_TIMEOUT_MS = 2500; // 시작 시 네트워크 대기 상한(ms) — 약한 신호(승강로·지하)에서도 캐시로 빠른 기동
 const APP_SHELL = "./index.html";
 const ASSETS = [
