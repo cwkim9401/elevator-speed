@@ -167,6 +167,13 @@
                                // 0.12→0.07: 완만한 출발 램프를 EMA가 흡수하는 양은 게이트 크기에 비례하므로
                                // 절반 수준으로 축소. 윈도 평균의 노이즈는 ~0.015 m/s² 수준이라 0.07도 여유 충분.
   var BIAS_REWIND_MS = 2200;   // 출발 감지 시 바이어스·속도를 이만큼 과거로 되감아 재적분(램프 흡수 원천 차단)
+  // 되돌림 보정(retro) + 피드포워드(ff): 운행 중 진동 정류 바이어스 대책.
+  //  - retro: 정속 진입(quiet 지속) 시 "출발 이후 바이어스가 얼마나 변했나"를 wMean으로 실측해,
+  //           램프·학습지연 동안 속도에 쌓인 오차를 한 번에 소급 차감 (첫 런부터 정속 구간 정확)
+  //  - ff: 직전 런 후처리가 실측한 운행 바이어스를 다음 런 출발 순간 선주입 (둘째 런부터 램프도 정확)
+  var RETRO_QUIET_MS = 2000;   // 정속(quiet)이 이만큼 지속되면 되돌림 보정 발화
+  var RETRO_MIN_V = 0.3;       // 이 속도(m/s) 이상 순항 중일 때만 — 정지 상태 오발 방지
+  var FF_BIAS_CAP = 0.06;      // 되돌림 Δ̂·피드포워드 값의 절대 상한(m/s², 안전 레일)
   // 폴백(레스큐): 장시간 '엄격 조용' 지속 시 정지로 확정해 고착/틸트에서 회복.
   // 주의: 정속 순항도 가속도만으론 '엄격 조용'과 구분이 안 된다. 순항을 정지로 오인해 운행 중
   // 조기종료하면 결과가 통째로 틀어지므로(무증상 오류) 임계를 보수적으로 잡는다:
@@ -186,6 +193,15 @@
   var vDet = 0, biasA = 0, lastDetT = null, aDetPrev = 0;
   var moveAccSince = null, quietSince = null, sigmaBase = 0.03;
   var detBuf = [];             // 출발 전 되감기 버퍼: {t, aRaw, b(당시 바이어스), v(당시 속도)}
+  // 되돌림 보정·피드포워드 상태
+  var b0Dep = 0;               // 출발 순간의 바이어스(휴지 기준점)
+  var depT = null;             // 운행(진동) 시작 시각 근사(ms) — 감지 지연 ~0.7s 보정
+  var biasInt = 0;             // ∫(biasA - b0Dep)dt: 출발 후 EMA가 실제로 차감해 준 양(m/s)
+  var retroDone = true;        // 이번 런 되돌림 보정 완료 여부(런당 1회)
+  var rQuietSince = null;      // 되돌림용 quiet 연속 시작 시각
+  var rWSum = 0, rWCnt = 0;    // quiet 구간 wMean 누적(Δ̂ 측정용 — EMA 지연 없음)
+  var lastMoveBias = null;     // 직전 런 후처리가 실측한 운행 바이어스(m/s², 세션 한정)
+  var liveAdj = 0, liveAdjT = 0; // 되돌림 순간 표시 점프를 0.5s에 걸쳐 펴기(표시 전용)
   var motionSensor = null, sensorFallbackTimer = null, activeSensor = "devicemotion";
   var wakeLock = null;
   // 라이브 표시(그래프·숫자) 전용 상태 — 검출 로직과 분리, 표시에만 사용
@@ -294,6 +310,7 @@
     // 추정 바이어스가 비정상(레일 초과)이거나 도착 정지 데이터가 부족하면 전구간 선형으로 폴백.
     var tS = vel[0].t, tE = vel[vel.length-1].t;
     var span = (tE - tS) || 1, vEnd, segOK = false;
+    var moveBias = null;   // 운행 구간 바이어스율(m/s², 부호 포함) — 다음 런 피드포워드용
     if(iA >= 0 && iB > iA){
       var tA = av[iA].t, tB = av[iB].t;
       var pS=0, pC=0, pT=0, qS=0, qC=0, qT=0;
@@ -328,6 +345,7 @@
           vel[i].v -= Lb + Lr;
         }
         vEnd = vPost - vPre;               // 운행 구간 드리프트(안정도 보고용)
+        moveBias = extra/movSpan;          // 운행 중 '추가' 바이어스 실측치(라이브 피드포워드용)
         segOK = true;
       }
     }
@@ -399,7 +417,7 @@
       var edot = Math.min(1, Math.max(-1, base.gh.x*eb.gh.x + base.gh.y*eb.gh.y + base.gh.z*eb.gh.z));
       tiltDeg = Math.acos(edot)*180/Math.PI;
     }
-    return { cruise:cruise, maxV:maxV, dist:dist, duration:moveDur, fullSpan:fullSpan, vel:vel, cruiseStart:cs, cruiseEnd:ce, gmag:base.gmag, n:rideSamps.length, endDrift:Math.abs(vEnd), sensor:activeSensor, tiltDeg:tiltDeg, scaleK:base.k, cruiseSlope:cruiseSlope };
+    return { cruise:cruise, maxV:maxV, dist:dist, duration:moveDur, fullSpan:fullSpan, vel:vel, cruiseStart:cs, cruiseEnd:ce, gmag:base.gmag, n:rideSamps.length, endDrift:Math.abs(vEnd), sensor:activeSensor, tiltDeg:tiltDeg, scaleK:base.k, cruiseSlope:cruiseSlope, moveBias:moveBias };
   }
 
   // 출발 감지 순간 보정: 완만한 출발 램프에서는 (1) 바이어스 EMA가 초기 가속 일부를 흡수하고
@@ -494,7 +512,18 @@
         if(moveAccSince === null) moveAccSince = t;
         else if(t - moveAccSince >= MOVE_ACC_MS) hasMoved = true;
       } else moveAccSince = null;
-      if(hasMoved && !wasMoved) rewindBias();   // 출발 순간: 흡수된 바이어스·깎인 속도 복원
+      if(hasMoved && !wasMoved){                // 출발 순간: 흡수된 바이어스·깎인 속도 복원
+        rewindBias();
+        // 되돌림 보정 준비 — 기준점은 되감기 '후'의 휴지 바이어스.
+        // depT: 진동은 운행과 함께 시작되는데 감지가 ~0.7s 늦으므로 그만큼 당겨 잡는다.
+        b0Dep = biasA;
+        depT = Math.max(rideStartT, t - 700);
+        biasInt = 0; retroDone = false;
+        rQuietSince = null; rWSum = 0; rWCnt = 0;
+        // 피드포워드: 직전 런이 실측한 운행 바이어스를 선주입 → 램프 구간부터 정확.
+        // (retro의 Δ̂ 정의가 b0Dep 기준이라 주입분은 biasInt로 자동 상쇄되어 수학적으로 일관)
+        if(lastMoveBias !== null) biasA += lastMoveBias;
+      }
 
       // 폴백(레스큐): 장시간 '엄격 조용'이면 고착/틸트로 보고 vDet·바이어스 재설정
       var strictSd = Math.max(2.0*sigmaBase, 0.03);
@@ -508,9 +537,33 @@
         }
       } else quietSince = null;
 
+      // 되돌림 보정(런당 1회): 정속 진입 후 quiet가 RETRO_QUIET_MS 지속되면,
+      // quiet 구간 wMean 평균(EMA 지연 없음)으로 Δ̂ = 운행 중 바이어스 변화를 실측하고
+      // 출발 이후 쌓인 속도 오차 [Δ̂×경과 − 이미 차감된 양(biasInt)]을 vDet에서 한 번에 제거.
+      if(hasMoved && !retroDone){
+        biasInt += (biasA - b0Dep) * dt;
+        if(quiet){
+          if(rQuietSince === null){ rQuietSince = t; rWSum = 0; rWCnt = 0; }
+          else if(t - rQuietSince > 500){ rWSum += wMean; rWCnt++; }   // 첫 0.5s는 윈도 잔류 램프 배제
+          if(t - rQuietSince >= RETRO_QUIET_MS && rWCnt > 10 && Math.abs(vDet) > RETRO_MIN_V){
+            var dHat = rWSum/rWCnt - b0Dep;
+            if(Math.abs(dHat) < FF_BIAS_CAP){
+              var corr = dHat * (t - depT)/1000 - biasInt;
+              vDet -= corr;
+              liveAdj = corr; liveAdjT = t;        // 표시는 0.5s에 걸쳐 새 값으로 수렴
+              biasA = b0Dep + dHat;                // EMA도 실측값으로 점프(이후 오차 누적 차단)
+            }
+            retroDone = true;                      // 레일 초과여도 재시도 없음(런당 1회)
+          }
+        } else { rQuietSince = null; rWSum = 0; rWCnt = 0; }
+      }
+
       // 라이브 표시 버퍼(표시 전용 — 검출 로직에는 영향 없음)
       liveAEma += 0.25 * (aCorr - liveAEma);                  // 표시용 가속도 살짝 평활(~60ms)
-      liveBuf.push({ t:t, a:liveAEma, v:vDet });
+      var vDisp = vDet;
+      if(liveAdj && t > liveAdjT && t - liveAdjT < 500)
+        vDisp += liveAdj * (1 - (t - liveAdjT)/500);          // 되돌림 점프 이징
+      liveBuf.push({ t:t, a:liveAEma, v:vDisp });
       while(liveBuf.length && t - liveBuf[0].t > LIVE_SPAN_MS) liveBuf.shift();
       if(hasMoved && Math.abs(vDet) > liveMaxV) liveMaxV = Math.abs(vDet);
 
@@ -697,6 +750,7 @@
       recordStart = performance.now(); rideStartT = 0;
       baseMag = null; stillSince = null; hasMoved = false; stillWindow = [];
       liveBuf = []; liveMaxV = 0; liveAEma = 0; liveLastTxt = 0;
+      retroDone = true; rQuietSince = null; liveAdj = 0; liveAdjT = 0;   // 되돌림 상태 초기화(lastMoveBias는 세션 유지)
       requestWakeLock();
       $("results").classList.remove("show");
       $("liveWrap").style.display = "none";
@@ -733,6 +787,12 @@
       return;
     }
     var r = process(samples);
+    // 피드포워드: 이번 런이 실측한 운행 바이어스를 다음 런 출발 시 선주입(세션 한정).
+    // 정속 기울어짐(바이어스 변동) 경고가 뜬 런의 값은 신뢰할 수 없으므로 갱신하지 않는다.
+    if(r && r.moveBias != null && isFinite(r.moveBias) && Math.abs(r.moveBias) < FF_BIAS_CAP){
+      var sOK = !(r.cruiseSlope != null && r.cruise > 0 && Math.abs(r.cruiseSlope)/Math.max(r.cruise,0.1) >= 0.035);
+      if(sOK) lastMoveBias = r.moveBias;
+    }
     showResults(r);
     pushHistory(r);
     $("status").innerHTML = auto ? "정지 감지 — <b>자동 종료</b>되었습니다. 결과를 확인하세요."
