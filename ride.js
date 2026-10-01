@@ -4,24 +4,14 @@
   let busy=false, kind='', token=0, capture=null, last=null, prepared=null;
   let stream=null, ctx=null, node=null, source=null, sensor=null, wake=null;
   let timer=null, fallback=null, sensorKind='', audioClock=0, started=0;
-  let calibration=null, folder=null, saving=false;
+  let folder=null, saving=false;
   window.ElevatorRideBusy=()=>busy;
   const status=text=>{$('rideStatus').textContent=text;};
-  function mode(ride){
-    if(busy||(window.ElevatorSpeedBusy&&window.ElevatorSpeedBusy())){alert('진행 중인 측정을 먼저 종료하세요.');return;}
-    $('speedPanel').hidden=ride;$('ridePanel').hidden=!ride;
-    for(const [id,on] of [['speedMode',!ride],['rideMode',ride]]){
-      $(id).classList.toggle('active',on);$(id).setAttribute('aria-pressed',String(on));
-    }
-  }
-  $('speedMode').onclick=()=>mode(false);$('rideMode').onclick=()=>mode(true);
   function controls(){
-    $('calibrateSound').disabled=busy||saving;
-    $('rideSite').disabled=busy;$('rideDirection').disabled=busy;$('soundReference').disabled=busy;
-    $('saveEsv').disabled=busy||saving||!prepared||!Number.isFinite(last&&last.calibrationOffset);
+    $('saveEsv').disabled=busy||saving||!prepared;
     $('saveRideRaw').disabled=busy||saving||!last;
     $('rideStart').disabled=saving||(busy&&kind!=='ride');
-    $('rideStart').textContent=busy&&kind==='ride'?'측정 종료':'승차감 측정 시작';
+    $('rideStart').textContent=busy&&kind==='ride'?'측정 종료':'승차감 · 속도 측정 시작';
     $('rideStart').classList.toggle('stop',busy&&kind==='ride');
   }
   function alive(id){if(id!==token||!busy)throw Error('측정 시작이 취소되었습니다.');}
@@ -36,9 +26,6 @@
     if(['echoCancellation','noiseSuppression','autoGainControl'].some(k=>settings[k]===true))
       throw Error('마이크 자동 음량·잡음 처리를 끌 수 없습니다. 다른 브라우저를 사용하세요.');
     capture.microphone={label:track.label,settings};
-    if(kind==='ride'&&calibration&&calibration.deviceId===settings.deviceId&&calibration.microphone===track.label){
-      capture.calibrationOffset=calibration.offset;capture.calibration={...calibration};
-    }
     track.onended=()=>{if(busy)stop('마이크가 중단되었습니다.');};
     await ac.audioWorklet.addModule('./sound-worklet.js');alive(id);
     if(ac.state!=='running')throw Error('마이크 오디오가 시작되지 않았습니다. 다시 눌러주세요.');
@@ -98,28 +85,26 @@
     if(ctx){ctx.close().catch(()=>{});ctx=null;}
     if(wake){wake.release().catch(()=>{});wake=null;}
   }
-  async function start(which){
-    if(busy||saving||(window.ElevatorSpeedBusy&&window.ElevatorSpeedBusy()))return;
-    const ref=Number($('soundReference').value);
-    if(which==='calibration'&&(!$('soundReference').value||ref<20||ref>120)){status('기준 소음계 값을 20~120 dB 범위로 입력하세요.');return;}
+  async function start(){
+    if(busy||saving)return;
     busy=true;kind='starting';const id=++token;
-    capture={version:1,capturedAt:new Date().toISOString(),site:$('rideSite').value.trim(),direction:$('rideDirection').value,
-      samples:[],audio:[],calibrationOffset:null,clipped:false,reference:ref};
+    capture={version:2,capturedAt:new Date().toISOString(),direction:'unknown',
+      samples:[],audio:[],soundUnit:'dBFS',soundEncoding:'normalized-digital-rms-uncalibrated',clipped:false,baselineTrimMs:500};
     controls();status('마이크와 센서 권한을 확인하고 있습니다…');
     try{
-      if(typeof DeviceMotionEvent!=='undefined'&&typeof DeviceMotionEvent.requestPermission==='function'&&which==='ride'){
+      if(typeof DeviceMotionEvent!=='undefined'&&typeof DeviceMotionEvent.requestPermission==='function'){
         if(await DeviceMotionEvent.requestPermission()!=='granted')throw Error('가속도 센서 권한이 필요합니다.');alive(id);
       }
-      kind=which;await microphone(id);alive(id);
+      await microphone(id);alive(id);
       if(navigator.wakeLock){try{
         const lock=await navigator.wakeLock.request('screen');
         if(id!==token||!busy){await lock.release();return;}wake=lock;
       }catch(_){}}
       alive(id);started=performance.now();
-      if(which==='ride'){
-        $('rideResult').hidden=true;
-        status('3초간 정지하세요. 화면은 위를 향하게 고정합니다.');accelerometer();
-      }else status('기준 소음계와 나란히 놓고 5초간 같은 소리를 측정합니다.');
+      kind='ride';$('rideResult').hidden=true;
+      $('rideTime').textContent='0.0 s';$('soundLive').textContent='– dBFS';
+      $('rideChart').getContext('2d').clearRect(0,0,$('rideChart').width,$('rideChart').height);
+      status('처음 0.5초는 제외하고 정지 기준을 잡습니다. 화면을 위로 고정하세요.');accelerometer();
       timer=setInterval(tick,100);controls();
     }catch(e){if(id===token)stop(e.message||'권한 또는 센서 시작에 실패했습니다.');}
   }
@@ -128,20 +113,14 @@
     const now=performance.now(),a=capture.audio.at(-1),s=capture.samples;
     if(now-started>3000&&(!a||now-a.t>1000)){stop('마이크 데이터가 끊겼습니다.');return;}
     const power=capture.audio.slice(-12).reduce((sum,p)=>sum+p.power,0)/Math.max(1,Math.min(12,capture.audio.length));
-    const calibrated=Number.isFinite(capture.calibrationOffset),offset=calibrated?capture.calibrationOffset:0;
-    $('soundLive').textContent=core.soundDb(power,offset).toFixed(1)+(calibrated?' dB':' dBFS');
-    $('soundUnit').textContent=calibrated?'소음 · 보정 추정 (비가중)':'소음 · 미보정';
-    if(kind==='calibration'){
-      const elapsed=a&&capture.audio.length?(a.t-capture.audio[0].t)/1000:0;
-      status('소음 보정 중… '+Math.max(0,5-elapsed).toFixed(1)+'초');
-      if(elapsed>=5)stop();return;
-    }
+    $('soundLive').textContent=core.soundDb(power).toFixed(1)+' dBFS';
     if(now-started>5000&&!s.length){stop('가속도 센서 응답이 없습니다. 권한과 브라우저를 확인하세요.');return;}
     if(s.length&&now-s.at(-1).t>1000){stop('가속도 센서 응답이 중단되었습니다.');return;}
     if(!s.length)return;
     const elapsed=(s.at(-1).t-s[0].t)/1000;
     $('rideTime').textContent=elapsed.toFixed(1)+' s';
-    if(elapsed<3.1)status('정지 기준 측정… '+Math.max(0,3.1-elapsed).toFixed(1)+'초');
+    if(elapsed<0.5)status('버튼을 누른 흔들림을 제외하는 중…');
+    else if(elapsed<3.1)status('정지 기준 측정… '+Math.max(0,3.1-elapsed).toFixed(1)+'초');
     else {
       if(!capture.baseline){try{capture.baseline=core.baseline(s);}catch(e){stop(e.message);return;}}
       status('측정 중 · 운행 후 3초 기다린 뒤 종료하세요.');draw(s,capture.baseline);
@@ -150,32 +129,32 @@
   }
   function stop(error){
     if(!busy)return;
-    const was=kind;busy=false;kind='';++token;cleanup();
-    if(was==='calibration'){
-      try{
-        if(error)throw Error(error);
-        const a=capture.audio;
-        if(a.length<300||a.at(-1).t-a[0].t<4900||capture.clipped)throw Error('보정 데이터 부족 또는 마이크 포화입니다.');
-        if(a.some((p,i)=>i&&p.t-a[i-1].t>100))throw Error('보정 중 소음 기록이 끊겼습니다.');
-        const powers=a.slice(50).map(p=>p.power),avg=powers.reduce((s,p)=>s+p,0)/powers.length;
-        if(avg<1e-12)throw Error('마이크 신호가 너무 작아 보정할 수 없습니다.');
-        calibration={offset:capture.reference-core.soundDb(avg),deviceId:capture.microphone.settings.deviceId,
-          reference:capture.reference,at:new Date().toISOString(),microphone:capture.microphone.label};
-        $('calibrationStatus').textContent='보정 완료 · 기준 '+capture.reference+' dB / '+calibration.microphone+' · 이번 앱 실행 동안 적용';
-        status('소음 보정 완료. 승차감 측정을 시작하세요.');
-      }catch(e){status(e.message);}
-    }else{
-      capture.sensor=sensorKind;capture.error=error||null;last=capture;prepared=null;
-      $('rideResult').hidden=false;
-      try{
-        if(error)throw Error(error);prepared=core.prepare(last);
-        const r=core.summary(prepared,last.calibrationOffset);
-        $('rideSummary').textContent='운행 기록 '+r.duration.toFixed(2)+'초 · 실제 센서 '+r.hz.toFixed(1)+' Hz\n'+
-          r.axes.map((a,i)=>['X','Y','Z'][i]+': RMS '+a.rms.toFixed(2)+' / 최대 절댓값 '+a.peak.toFixed(2)+' gal').join('\n')+
-          '\n전체 소음 에너지 평균 '+r.sound.toFixed(1)+(Number.isFinite(last.calibrationOffset)?' dB (보정 추정·비가중)':' dBFS (미보정)');
-        status(Number.isFinite(last.calibrationOffset)?'기록 완료. ESV를 저장할 수 있습니다.':'기록 완료. 미보정 소음은 ESV로 저장할 수 없습니다. 원본 JSON을 저장하거나 소음 보정 후 다시 측정하세요.');
-      }catch(e){$('rideSummary').textContent=e.message;status('측정 미완료: '+e.message+' 원본 JSON은 저장할 수 있습니다.');}
-    }
+    busy=false;kind='';++token;cleanup();
+    capture.sensor=sensorKind;capture.error=error||null;last=capture;prepared=null;
+    $('rideResult').hidden=false;
+    for(const id of ['resultSpeed','resultX','resultY','resultZ','resultSound'])$(id).textContent='–';
+    $('resultSpeedLabel').textContent='속도';$('speedDetail').textContent='';
+    try{
+      if(error)throw Error(error);
+      prepared=core.prepare(last);
+      const speed=core.speedResult(last,ElevatorMeasurement);
+      last.direction=speed.direction;last.speed=speed.result;last.speedError=speed.error;
+      const r=core.summary(prepared);last.summary=r;
+      if(speed.result){
+        const v=speed.result.cruise??speed.result.maxV;
+        $('resultSpeedLabel').textContent=speed.result.cruise===null?'최고 속도 (정속 구간 없음)':'정속 속도';
+        $('resultSpeed').textContent=v.toFixed(2)+' m/s';
+        $('speedDetail').textContent=(v*60).toFixed(1)+' m/min · '+(speed.direction==='up'?'상승':speed.direction==='dn'?'하강':'방향 미확인');
+      }else{
+        $('resultSpeed').textContent='계산 불가';$('speedDetail').textContent=speed.error;
+      }
+      r.axes.forEach((a,i)=>{$(['resultX','resultY','resultZ'][i]).textContent=a.rms.toFixed(2)+' gal';});
+      $('resultSound').textContent=r.sound.toFixed(1)+' dBFS';
+      $('rideSummary').textContent='기록 '+r.duration.toFixed(2)+'초 · 센서 '+r.hz.toFixed(1)+' Hz\n'+
+        '최대 절댓값: '+r.axes.map((a,i)=>['X','Y','Z'][i]+' '+a.peak.toFixed(2)).join(' / ')+' gal'+
+        (speed.result&&speed.result.warnings.length?'\n'+speed.result.warnings.join('\n'):'');
+      status('기록 완료. ESV를 저장할 수 있습니다.');
+    }catch(e){$('rideSummary').textContent=e.message;status('측정 미완료: '+e.message+' 원본 JSON은 저장할 수 있습니다.');}
     controls();
   }
   function draw(s,b){
@@ -226,10 +205,7 @@
       $('saveStatus').textContent='다운로드 요청: '+name+'\n브라우저 다운로드 위치를 확인하세요. ELScan 폴더로 자동 저장된 것은 아닙니다.';
     }
   }
-  function filename(extension){
-    const site=(last.site||'elevator').replace(/[<>:"/\\|?*\x00-\x1f]/g,'_').slice(0,60);
-    return site+'_PHONE_TEST_'+last.capturedAt.replace(/[-:.]/g,'')+'_'+last.direction+'_RQ.'+extension;
-  }
+  function filename(extension){return core.filename(last,extension);}
   async function saveCapture(raw){
     if(saving||busy||!last)return;saving=true;controls();
     try{
@@ -239,7 +215,7 @@
       await save(blob,filename(raw?'json':'esv'));
     }catch(e){$('saveStatus').textContent='저장 실패: '+e.message;}finally{saving=false;controls();}
   }
-  $('rideStart').onclick=()=>busy?stop():start('ride');$('calibrateSound').onclick=()=>start('calibration');
+  $('rideStart').onclick=()=>busy?stop():start();
   $('saveEsv').onclick=()=>saveCapture(false);$('saveRideRaw').onclick=()=>saveCapture(true);
   document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='hidden'&&busy)stop('화면이 숨겨져 측정을 중단했습니다.');});
   window.addEventListener('pagehide',()=>{if(busy)stop('페이지를 닫아 측정을 중단했습니다.');});

@@ -1,7 +1,7 @@
 {
   "name": "엘리베이터 속도 · 승차감 측정기",
   "short_name": "엘베측정",
-  "description": "속도와 승차감·소음을 각각 측정하고 시험용 EL-Scan ESV를 저장합니다.",
+  "description": "속도와 승차감·상대 소음을 함께 측정하고 시험용 EL-Scan ESV를 저장합니다.",
   "lang": "ko",
   "start_url": "./",
   "scope": "./",

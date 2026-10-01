@@ -1,7 +1,7 @@
 /* Pure measurement engine. Units: milliseconds in, seconds / m/s / m/s² out. */
 (function(root){
   'use strict';
-  const VERSION = '2.0.0';
+  const VERSION = '2.1.0';
   const mean = a => a.reduce((s,v) => s+v,0)/a.length;
   const sd = a => { const m=mean(a); return Math.sqrt(mean(a.map(v=>(v-m)**2))); };
   const median = a => { const b=a.slice().sort((x,y)=>x-y), n=b.length; return n ? (b[(n-1)>>1]+b[n>>1])/2 : 0; };
@@ -56,7 +56,7 @@
   function analyze(samples,options={}){
     const quality=validate(samples), t0=samples[0].t;
     const baselineEnd=options.baselineEnd ?? t0+3000;
-    const baseSamples=samples.filter(s=>s.t>=t0+400 && s.t<baselineEnd);
+    const baseSamples=samples.filter(s=>s.t>=t0+500 && s.t<baselineEnd);
     if(baseSamples.length<20 || baseSamples.at(-1).t-baseSamples[0].t<2300)
       fail('BASELINE','출발 전 정지 기준 데이터가 부족합니다.');
     const base=baseline(baseSamples), sigma=sd(baseSamples.map(s=>vertical(base,s)));
