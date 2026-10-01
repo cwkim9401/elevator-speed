@@ -30,6 +30,7 @@
     await ac.audioWorklet.addModule('./sound-worklet.js');alive(id);
     if(ac.state!=='running')throw Error('마이크 오디오가 시작되지 않았습니다. 다시 눌러주세요.');
     audioClock=performance.now()-ac.currentTime*1000;
+    capture.audioClock={offsetMs:audioClock,source:'AudioContext.currentTime',target:'performance.now'};
     source=ac.createMediaStreamSource(media);node=new AudioWorkletNode(ac,'elevator-sound-meter');
     node.port.onmessage=e=>{
       if(id!==token||!busy)return;
@@ -41,12 +42,12 @@
     // The worklet outputs silence; connect it to keep processing, never play microphone audio.
     source.connect(node);node.connect(ac.destination);
   }
-  function accept(x,y,z,t){
+  function accept(x,y,z,t,rawT,receivedAt){
     if(!busy||kind!=='ride'||![x,y,z,t].every(Number.isFinite))return;
     const a=capture.samples,prev=a.at(-1);
     if(prev&&t<=prev.t)return;
     if(prev&&t-prev.t>150){stop('가속도 데이터가 끊겼습니다.');return;}
-    a.push({t,x,y,z});
+    a.push({t,x,y,z,...(Number.isFinite(rawT)?{rawT,receivedAt}:{})});
     if(a.length===1)started=performance.now();
   }
   function motion(e){
@@ -63,7 +64,9 @@
         sensor=new Accelerometer({frequency:120});
         sensor.addEventListener('reading',()=>{
           sensorKind='accelerometer';clearTimeout(fallback);
-          accept(sensor.x,sensor.y,sensor.z,sensor.timestamp);
+          const received=performance.now(),raw=sensor.timestamp;
+          if(!Number.isFinite(raw))return;
+          accept(sensor.x,sensor.y,sensor.z,core.sensorTime(capture.sensorClock,raw,received),raw,received);
         });
         sensor.addEventListener('error',()=>{
           if(!busy)return;
@@ -88,7 +91,7 @@
   async function start(){
     if(busy||saving)return;
     busy=true;kind='starting';const id=++token;
-    capture={version:2,capturedAt:new Date().toISOString(),direction:'unknown',
+    capture={version:3,capturedAt:new Date().toISOString(),direction:'unknown',sensorClock:{},
       samples:[],audio:[],soundUnit:'dBFS',soundEncoding:'normalized-digital-rms-uncalibrated',clipped:false,baselineTrimMs:500};
     controls();status('마이크와 센서 권한을 확인하고 있습니다…');
     try{
@@ -134,27 +137,38 @@
     $('rideResult').hidden=false;
     for(const id of ['resultSpeed','resultX','resultY','resultZ','resultSound'])$(id).textContent='–';
     $('resultSpeedLabel').textContent='속도';$('speedDetail').textContent='';
-    try{
-      if(error)throw Error(error);
-      prepared=core.prepare(last);
-      const speed=core.speedResult(last,ElevatorMeasurement);
-      last.direction=speed.direction;last.speed=speed.result;last.speedError=speed.error;
-      const r=core.summary(prepared);last.summary=r;
-      if(speed.result){
-        const v=speed.result.cruise??speed.result.maxV;
-        $('resultSpeedLabel').textContent=speed.result.cruise===null?'최고 속도 (정속 구간 없음)':'정속 속도';
-        $('resultSpeed').textContent=v.toFixed(2)+' m/s';
-        $('speedDetail').textContent=(v*60).toFixed(1)+' m/min · '+(speed.direction==='up'?'상승':speed.direction==='dn'?'하강':'방향 미확인');
-      }else{
-        $('resultSpeed').textContent='계산 불가';$('speedDetail').textContent=speed.error;
-      }
+    const issues=[];
+    try{prepared=core.prepare(last);}catch(e){issues.push('ESV: '+e.message);}
+    let acceleration=null;
+    try{acceleration=prepared||core.prepare({...last,error:null},{accelerationOnly:true});}
+    catch(e){issues.push('진동: '+e.message);}
+    const speed=core.speedResult(last,ElevatorMeasurement);
+    last.direction=speed.direction;last.speed=speed.result;last.speedError=speed.error;
+    if(speed.result){
+      const v=speed.result.cruise??speed.result.maxV;
+      $('resultSpeedLabel').textContent=speed.result.cruise===null?'최고 속도 (정속 구간 없음)':'정속 속도';
+      $('resultSpeed').textContent=v.toFixed(2)+' m/s';
+      $('speedDetail').textContent=(v*60).toFixed(1)+' m/min · '+(speed.direction==='up'?'상승':speed.direction==='dn'?'하강':'방향 미확인');
+    }else{
+      $('resultSpeed').textContent='계산 불가';$('speedDetail').textContent=speed.error;
+    }
+    const details=[];
+    if(acceleration){
+      const r=core.summary(acceleration);last.summary=r;
       r.axes.forEach((a,i)=>{$(['resultX','resultY','resultZ'][i]).textContent=a.rms.toFixed(2)+' gal';});
-      $('resultSound').textContent=r.sound.toFixed(1)+' dBFS';
-      $('rideSummary').textContent='기록 '+r.duration.toFixed(2)+'초 · 센서 '+r.hz.toFixed(1)+' Hz\n'+
-        '최대 절댓값: '+r.axes.map((a,i)=>['X','Y','Z'][i]+' '+a.peak.toFixed(2)).join(' / ')+' gal'+
-        (speed.result&&speed.result.warnings.length?'\n'+speed.result.warnings.join('\n'):'');
-      status('기록 완료. ESV를 저장할 수 있습니다.');
-    }catch(e){$('rideSummary').textContent=e.message;status('측정 미완료: '+e.message+' 원본 JSON은 저장할 수 있습니다.');}
+      details.push('가속도 기록 '+r.duration.toFixed(2)+'초 · 센서 '+r.hz.toFixed(1)+' Hz',
+        '최대 절댓값: '+r.axes.map((a,i)=>['X','Y','Z'][i]+' '+a.peak.toFixed(2)).join(' / ')+' gal');
+    }
+    try{
+      const sound=prepared?core.summary(prepared).sound:core.audioSummary(last);
+      $('resultSound').textContent=sound.toFixed(1)+' dBFS';last.soundSummary=sound;
+      if(!prepared)details.push('소음은 별도 녹음 구간의 평균입니다.');
+    }catch(e){issues.push('소음: '+e.message);}
+    if(error)details.push('기록 중단: '+error);
+    if(speed.result)details.push(...speed.result.warnings);
+    details.push(...issues);last.resultIssues=issues;
+    $('rideSummary').textContent=details.join('\n');
+    status(prepared?'기록 완료. ESV를 저장할 수 있습니다.':'확인 가능한 결과를 표시했습니다. ESV 저장 불가 이유를 아래에서 확인하세요.');
     controls();
   }
   function draw(s,b){

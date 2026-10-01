@@ -12,7 +12,7 @@
 - `esv-header.js`, `sound-worklet.js`, `sw.js`
 - `manifest.webmanifest`, `icon-192.png`, `icon-512.png`
 
-오프라인 캐시 v37. 로컬 수정만으로 기존 휴대폰 앱이 바뀌지는 않습니다. 기존 호스팅에 위 파일을 함께 업데이트하고 온라인에서 앱을 열었다 닫고 다시 실행하세요.
+오프라인 캐시 v38. 로컬 수정만으로 기존 휴대폰 앱이 바뀌지는 않습니다. 기존 호스팅에 위 파일을 함께 업데이트하고 온라인에서 앱을 열었다 닫고 다시 실행하세요.
 
 검증: `node --test measurement.test.cjs sw.test.cjs ride.test.cjs`
 

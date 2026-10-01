@@ -23,32 +23,38 @@
       throw Error('기준 측정 중 움직였습니다. 정지 상태에서 다시 시작하세요.');
     return b;
   }
-  function prepare(capture){
+  function prepare(capture,options={}){
+    const accelerationOnly=options.accelerationOnly===true;
     const s=capture.samples, audio=capture.audio;
     const b=baseline(s);
-    check(audio,['power'],100,'소음');
-    if(audio.some(p=>p.power<0)) throw Error('소음 에너지가 유효하지 않습니다.');
-    const start=s[0].t+3000, end=Math.min(s.at(-1).t,audio.at(-1).t);
-    if(audio[0].t>start||end-start<3000) throw Error('가속도와 소음의 동시 기록이 부족합니다.');
+    if(!accelerationOnly){
+      check(audio,['power'],100,'소음');
+      if(audio.some(p=>p.power<0)) throw Error('소음 에너지가 유효하지 않습니다.');
+    }
+    const start=s[0].t+3000, end=accelerationOnly?s.at(-1).t:Math.min(s.at(-1).t,audio.at(-1).t);
+    if(end-start<3000||(!accelerationOnly&&audio[0].t>start))
+      throw Error(accelerationOnly?'운행 기록이 부족합니다.':'가속도와 소음의 동시 기록이 부족합니다.');
     const gaps=s.slice(1).map((r,i)=>r.t-s[i].t).sort((a,b)=>a-b);
     const hz=1000/gaps[Math.floor(gaps.length/2)];
     if(hz<20) throw Error('가속도 기록이 너무 느립니다(20 Hz 미만).');
     if(hz>260) throw Error('256 Hz를 초과한 기록은 별도 저역통과 처리가 필요합니다.');
     if(capture.error) throw Error('중단된 기록입니다. 원본을 저장하고 다시 측정하세요.');
-    if(capture.clipped) throw Error('마이크 입력이 포화되었습니다. 마이크 위치를 확인하세요.');
+    if(!accelerationOnly&&capture.clipped) throw Error('마이크 입력이 포화되었습니다. 마이크 위치를 확인하세요.');
     const n=Math.floor((end-start)*RATE/1000)+1;
     if(n>RATE*600) throw Error('최대 10분까지만 저장할 수 있습니다.');
     const axes=[new Float64Array(n),new Float64Array(n),new Float64Array(n)];
-    const power=new Float64Array(n);
+    const power=accelerationOnly?null:new Float64Array(n);
     let j=1,k=1;
     for(let i=0;i<n;i++){
       const t=start+i*1000/RATE;
       while(j<s.length-1&&s[j].t<t)j++;
-      while(k<audio.length-1&&audio[k].t<t)k++;
       const p=s[j-1],q=s[j],f=(t-p.t)/(q.t-p.t);
       ['x','y','z'].forEach((key,c)=>axes[c][i]=p[key]+f*(q[key]-p[key])-b[key]);
-      const ap=audio[k-1],aq=audio[k],af=(t-ap.t)/(aq.t-ap.t);
-      power[i]=Math.max(0,ap.power+af*(aq.power-ap.power));
+      if(!accelerationOnly){
+        while(k<audio.length-1&&audio[k].t<t)k++;
+        const ap=audio[k-1],aq=audio[k],af=(t-ap.t)/(aq.t-ap.t);
+        power[i]=Math.max(0,ap.power+af*(aq.power-ap.power));
+      }
     }
     return {axes,power,n,hz,baseline:b,duration:n/RATE};
   }
@@ -58,7 +64,7 @@
     const r=prepared||prepare(capture);
     const buffer=new ArrayBuffer(HEADER+r.n*32), bytes=new Uint8Array(buffer),v=new DataView(buffer);
     bytes.set(header);bytes.fill(0,320,928);v.setFloat64(264,r.n/RATE,true);
-    const label=('\r\nPHONE EXPERIMENTAL\r\nSOUND UNCALIBRATED RMS / NOT SPL\r\n'+(capture.capturedAt||'')+'\r\n'+({up:'UP',dn:'DOWN'}[capture.direction]||'UNKNOWN')).slice(0,280);
+    const label=('\r\nPHONE EXPERIMENTAL\r\nSOUND UNCALIBRATED RMS / NOT SPL\r\n'+(capture.timeAlignment==='approximate-starts'?'TIME ALIGNMENT APPROXIMATE\r\n':'')+(capture.capturedAt||'')+'\r\n'+({up:'UP',dn:'DOWN'}[capture.direction]||'UNKNOWN')).slice(0,280);
     for(let i=0;i<label.length;i++)v.setUint16(320+i*2,label.charCodeAt(i),true);
     for(let c=0;c<3;c++)for(let i=0;i<r.n;i++)v.setFloat64(HEADER+(c*r.n+i)*8,32768+r.axes[c][i]*GAIN,true);
     // Normalized digital microphone RMS, NOT pressure in Pa. Legacy SPL displays
@@ -74,7 +80,7 @@
     return {hz:r.hz,duration:r.duration,axes:r.axes.map(a=>{
       let sq=0,peak=0;for(const x of a){sq+=x*x;peak=Math.max(peak,Math.abs(x));}
       return {rms:Math.sqrt(sq/a.length)*100,peak:peak*100};
-    }),sound:soundDb(mean(r.power))};
+    }),sound:r.power?soundDb(mean(r.power)):null};
   }
   function speedResult(capture,engine){
     try{
@@ -90,6 +96,21 @@
     const dir=['up','dn'].includes(capture.direction)?capture.direction:'unknown';
     return 'PHONE_'+stamp+'_'+dir+'_RQ.'+extension;
   }
-  const api={RATE,HEADER,GAIN,baseline,prepare,writeESV,summary,soundDb,speedResult,filename};
+  function sensorTime(clock,raw,received){
+    if(!Number.isFinite(received)||!Number.isFinite(raw))throw Error('센서 시각이 유효하지 않습니다.');
+    // Some Android implementations expose time since boot instead of page origin.
+    // Estimate a constant epoch offset once; retain sensor intervals thereafter.
+    if(!Number.isFinite(clock.offsetMs)){
+      clock.offsetMs=received-raw;clock.firstRawMs=raw;clock.firstReceivedMs=received;
+      clock.method='first-event-offset';clock.target='performance.now';
+    }
+    return raw+clock.offsetMs;
+  }
+  function audioSummary(capture){
+    check(capture.audio,['power'],100,'소음');
+    if(capture.clipped||capture.audio.some(p=>p.power<0))throw Error('소음 데이터 오류 또는 마이크 포화입니다.');
+    return soundDb(mean(capture.audio.map(p=>p.power)));
+  }
+  const api={RATE,HEADER,GAIN,baseline,prepare,writeESV,summary,soundDb,speedResult,filename,sensorTime,audioSummary};
   if(typeof module!=='undefined'&&module.exports)module.exports=api;else root.RideCore=api;
 })(globalThis);

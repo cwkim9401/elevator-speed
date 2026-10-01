@@ -1,6 +1,6 @@
 /* Keep HTML and its calculation engine in the same versioned offline bundle. */
 const CACHE_PREFIX = 'elevspeed-';
-const CACHE = `${CACHE_PREFIX}v37`;
+const CACHE = `${CACHE_PREFIX}v38`;
 const APP_SHELL = './index.html';
 const ASSETS = [APP_SHELL, './measurement.js', './ride-core.js', './ride.js', './sound-worklet.js', './esv-header.js', './manifest.webmanifest', './icon-192.png', './icon-512.png'];
 
