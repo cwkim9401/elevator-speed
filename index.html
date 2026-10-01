@@ -96,11 +96,12 @@
 
   <div class="card">
     <button id="btn" class="main">측정 시작</button>
+    <button id="exportRaw" class="sec" style="display:none; margin-top:10px; width:100%">최근 측정 원본 저장 (JSON)</button>
   </div>
 
   <div id="results" class="card results">
     <div class="hero">
-      <div class="label">정격속도 추정 (정속 구간)</div>
+      <div class="label">정속 구간 속도 추정</div>
       <div><span id="cruiseMs" class="val">–</span><span class="sub"> m/s</span></div>
       <div class="sub"><span id="cruiseMpm">–</span> m/min</div>
     </div>
@@ -132,58 +133,28 @@
   </div>
 
   <div class="card note">
+    휴대폰을 바닥이나 받침대에 <b>단단히 고정</b>하고 측정 중 만지지 마세요. 화면을 켠 채 앱을 유지하세요.<br>
     사용법: ① <b>정지 상태</b>에서 시작 → 3초 카운트다운(움직이면 다시 셈) → ② 안내가 뜨면 엘리베이터 운행
-    (정속 구간 확보를 위해 3~4개 층 이상 권장) → ③ 도착 후 <b>3초간 멈추면 자동 종료</b>됩니다.
+    (정속 구간 확보를 위해 3~4개 층 이상 권장) → ③ 도착 후 <b>3초간 멈추면 자동 종료</b>됩니다. 자동 종료되지 않으면 완전히 정지한 뒤 3초 이상 기다리고 수동 종료하세요.<br>
+    짧은 운행은 정격속도에 도달하지 않을 수 있습니다. 표시 자릿수는 정확도를 보증하지 않습니다.
     가속도계 적분 방식의 <b>현장 참고용</b>이며, 공단 정식 검사(회전속도계·엔코더)를 대체하지 않습니다.
     최초 1회 온라인 접속하면 이후 <b>오프라인</b>에서도 동작합니다.
   </div>
 
+<script src="measurement.js"></script>
 <script>
 (function(){
   "use strict";
-  var BASELINE_MS = 3000, SMOOTH_MS = 250, PLATEAU_FRAC = 0.8;
-  var G_REF = 9.799;       // 지역 중력(한국 중부 위도 실측치). 기기 감도(스케일) 보정의 기준값.
-  var TARGET_SENSOR_HZ = 120; // 지원 기기에서는 Generic Sensor API로 이 주파수를 요청한다.
-  var ACC_CRUISE = 0.20;   // 정속 판정: |수직가속도|가 이 값 미만이면 '가속 끝(정속)'으로 봄
-  var BASELINE_TRIM_MS = 400;  // 시작 직후(탭 진동) 구간은 기준 평균에서 제외
-  var DT_CAP = 0.2;            // dt 폭주(탭 전환·GC 멈춤) 방지: 적분 dt 상한(초)
-  var ACC_GATE = 0.08, V_FLOOR = 0.10; // 후처리 정지 클램프용(데드존/최저속도)
-
-  // ── 라이브 자동종료 검출 채널(적분속도 vDet + 온라인 바이어스 보정) ──
-  // vLive 데드존 방식의 '속도 드리프트 고착' 문제를 해결한다. 데드존으로 속도를 얼리는 대신
-  // 조용한 구간에서 센서 바이어스를 계속 추정·차감해 vDet가 표류하지 않게 하고, ZUPT로 0 고정.
-  var STOP_HOLD_MS = 3000;     // 운행 후 정지가 이만큼 지속되면 자동 종료
-  var MOVE_RESET_TH = 0.6;     // 기준 카운트다운 중 |가속도| 변화가 이보다 크면 리셋
-  var MOVED_TH = 0.25;         // vDet가 이 값을 넘으면 '운행 시작'으로 본다
-  var MOVE_ACC_TH = 0.35, MOVE_ACC_MS = 400; // 느린 크리프 대비: 가속도 지속으로도 운행 시작 판정
-  var STILL_V = 0.15;          // ZUPT/정지 판정 속도 임계
-  var STILL_WINDOW_MS = 800;   // 정지 판정 슬라이딩 윈도 길이
-  var QUIET_SD = 0.22;         // 윈도 표준편차가 이 값 미만이면 '진동 없음'
-  var QUIET_MEAN = 0.12;       // 보정 후 윈도 '평균' |가속도|가 이 값 미만이어야 '조용함'.
-                               // 표준편차만 보면 부드러운 등가속 램프(평균≠0, 편차≈0)가 조용함으로 오인되어
-                               // ZUPT가 vDet를 계속 0으로 눌러 출발 직후 정지로 판정→자동종료되는 버그가 있었음.
-  var BIAS_TAU = 2.0;          // 바이어스 EMA 시정수(초)
-  var BIAS_GATE = 0.07;        // |윈도평균-현재바이어스|가 이 값 미만일 때만 바이어스 갱신(램프 제외).
-                               // 0.12→0.07: 완만한 출발 램프를 EMA가 흡수하는 양은 게이트 크기에 비례하므로
-                               // 절반 수준으로 축소. 윈도 평균의 노이즈는 ~0.015 m/s² 수준이라 0.07도 여유 충분.
-  var BIAS_REWIND_MS = 2200;   // 출발 감지 시 바이어스·속도를 이만큼 과거로 되감아 재적분(램프 흡수 원천 차단)
-  // 되돌림 보정(retro) + 피드포워드(ff): 운행 중 진동 정류 바이어스 대책.
-  //  - retro: 정속 진입(quiet 지속) 시 "출발 이후 바이어스가 얼마나 변했나"를 wMean으로 실측해,
-  //           램프·학습지연 동안 속도에 쌓인 오차를 한 번에 소급 차감 (첫 런부터 정속 구간 정확)
-  //  - ff: 직전 런 후처리가 실측한 운행 바이어스를 다음 런 출발 순간 선주입 (둘째 런부터 램프도 정확)
-  var RETRO_QUIET_MS = 2000;   // 정속(quiet)이 이만큼 지속되면 되돌림 보정 발화
-  var RETRO_MIN_V = 0.3;       // 이 속도(m/s) 이상 순항 중일 때만 — 정지 상태 오발 방지
-  var FF_BIAS_CAP = 0.06;      // 되돌림 Δ̂·피드포워드 값의 절대 상한(m/s², 안전 레일)
-  // 폴백(레스큐): 장시간 '엄격 조용' 지속 시 정지로 확정해 고착/틸트에서 회복.
-  // 주의: 정속 순항도 가속도만으론 '엄격 조용'과 구분이 안 된다. 순항을 정지로 오인해 운행 중
-  // 조기종료하면 결과가 통째로 틀어지므로(무증상 오류) 임계를 보수적으로 잡는다:
-  //  - RESCUE_V: 최저 정격속도(0.5 m/s) 카의 라이브 추정치(램프 초기 ZUPT 손실로 실제보다 낮음)보다 충분히 낮게
-  //  - HARD: 통상 순항 시간보다 길게 + RESCUE_HARD_V 미만일 때만 (1.0 m/s 이상 순항은 절대 오인 안 함)
-  // 고착이 더 심한 경우는 자동종료를 포기하고 수동 종료에 맡긴다(정지 후 수동 종료는 후처리가 정확함).
-  var RESCUE_QUIET_MS = 6000, RESCUE_V = 0.25;
-  var RESCUE_HARD_MS = 30000, RESCUE_HARD_V = 1.0;
-  var IDLE_TIMEOUT_MS = 120000; // 운행 없이 방치되면 자동 취소
-  var LIVE_SPAN_MS = 12000;     // 라이브 그래프 표시 구간(ms)
+  var BASELINE_MS = 3000, BASELINE_TRIM_MS = 400;
+  var TARGET_SENSOR_HZ = 120;
+  var DT_CAP = 0.2; // Larger gaps cancel the recording before integration.
+  var STOP_HOLD_MS = 3000, MOVE_RESET_TH = 0.6;
+  var MOVED_TH = 0.25, MOVE_ACC_TH = 0.35, MOVE_ACC_MS = 400;
+  var STILL_V = 0.15, STILL_WINDOW_MS = 800;
+  var QUIET_SD = 0.12, QUIET_MEAN = 0.08;
+  // Learn bias only before departure; never absorb acceleration during a ride.
+  var BIAS_TAU = 2.0, BIAS_GATE = 0.07, BIAS_REWIND_MS = 2200;
+  var IDLE_TIMEOUT_MS = 120000, LIVE_SPAN_MS = 12000;
 
   var recording = false, phase = "idle";
   var samples = [], baselineSamples = [], baseline = null;
@@ -191,19 +162,25 @@
   var stillSince = null, hasMoved = false, baseMag = null, stillWindow = [];
   // 라이브 검출 상태
   var vDet = 0, biasA = 0, lastDetT = null, aDetPrev = 0;
-  var moveAccSince = null, quietSince = null, sigmaBase = 0.03;
+  var moveAccSince = null;
   var detBuf = [];             // 출발 전 되감기 버퍼: {t, aRaw, b(당시 바이어스), v(당시 속도)}
-  // 되돌림 보정·피드포워드 상태
-  var b0Dep = 0;               // 출발 순간의 바이어스(휴지 기준점)
-  var depT = null;             // 운행(진동) 시작 시각 근사(ms) — 감지 지연 ~0.7s 보정
-  var biasInt = 0;             // ∫(biasA - b0Dep)dt: 출발 후 EMA가 실제로 차감해 준 양(m/s)
-  var retroDone = true;        // 이번 런 되돌림 보정 완료 여부(런당 1회)
-  var rQuietSince = null;      // 되돌림용 quiet 연속 시작 시각
-  var rWSum = 0, rWCnt = 0;    // quiet 구간 wMean 누적(Δ̂ 측정용 — EMA 지연 없음)
-  var lastMoveBias = null;     // 직전 런 후처리가 실측한 운행 바이어스(m/s², 세션 한정)
-  var liveAdj = 0, liveAdjT = 0; // 되돌림 순간 표시 점프를 0.5s에 걸쳐 펴기(표시 전용)
   var motionSensor = null, sensorFallbackTimer = null, activeSensor = "devicemotion";
-  var wakeLock = null;
+  var wakeLock = null, starting = false, lastCapture = null;
+  var rideDirection = 0, brakeSince = null, brakingSeen = false;
+  function rememberCapture(reason, result){
+    if(!samples.length) return;
+    lastCapture={version:ElevatorMeasurement.VERSION, capturedAt:new Date().toISOString(),
+      sensor:activeSensor, baselineEnd:rideStartT, reason:reason, samples:samples.slice(), result:result||null};
+    $("exportRaw").style.display="block";
+  }
+  document.getElementById("exportRaw").addEventListener("click",function(){
+    if(!lastCapture) return;
+    var url=URL.createObjectURL(new Blob([JSON.stringify(lastCapture)],{type:"application/json"}));
+    var link=document.createElement("a"); link.href=url;
+    link.download="elevator-"+lastCapture.capturedAt.replace(/[:.]/g,"-")+".json";
+    document.body.appendChild(link); link.click(); link.remove();
+    setTimeout(function(){URL.revokeObjectURL(url);},1000);
+  });
   // 라이브 표시(그래프·숫자) 전용 상태 — 검출 로직과 분리, 표시에만 사용
   var liveBuf = [], liveMaxV = 0, liveAEma = 0, liveRaf = null, liveLastTxt = 0;
 
@@ -220,204 +197,15 @@
   }
   checkEnv();
 
-  function computeBaseline(samps){
-    var sx=0, sy=0, sz=0, n=samps.length||1, i;
-    for (i=0;i<samps.length;i++){ sx+=samps[i].x; sy+=samps[i].y; sz+=samps[i].z; }
-    var gx=sx/n, gy=sy/n, gz=sz/n;
-    var gmag=Math.hypot(gx,gy,gz)||1;
-    // 감도(스케일) 보정계수: 측정한 중력 크기를 지역 중력 G_REF로 정규화.
-    // 기기별 감도 오차(0.5~3%)는 바이어스 보정으로 안 잡히고 속도·거리에 그대로 비례하므로 1차 보정.
-    // 기준 중력이 비정상 범위면(기준 오염·센서 이상) 보정하지 않는다.
-    var k = (gmag > 9.5 && gmag < 10.1) ? G_REF/gmag : 1;
-    return { gh:{x:gx/gmag,y:gy/gmag,z:gz/gmag}, gmag:gmag, k:k };
-  }
-  function vertAccel(b, s){ return (s.x*b.gh.x + s.y*b.gh.y + s.z*b.gh.z - b.gmag) * b.k; }
-  // 기준 구간 수직가속도의 표준편차(센서/거치 노이즈 바닥). 적응형 임계의 기준값.
+  var computeBaseline = ElevatorMeasurement.baseline;
+  var vertAccel = ElevatorMeasurement.vertical;
   function baselineSigma(b, samps){
-    var n = samps.length, i, a, s1 = 0, s2 = 0;
-    if(n < 2) return 0.03;
-    for(i=0;i<n;i++){ a = vertAccel(b, samps[i]); s1 += a; s2 += a*a; }
-    var mean = s1/n, varr = Math.max(0, s2/n - mean*mean);
-    return Math.sqrt(varr);
+    var a=samps.map(function(s){return vertAccel(b,s);});
+    var m=a.reduce(function(x,y){return x+y;},0)/a.length;
+    return Math.sqrt(a.reduce(function(x,y){return x+(y-m)*(y-m);},0)/a.length);
   }
-
-  function median(arr){
-    if(!arr.length) return 0;
-    var s = arr.slice().sort(function(a,b){return a-b;});
-    var m = Math.floor(s.length/2);
-    return s.length%2 ? s[m] : (s[m-1]+s[m])/2;
-  }
-  function smooth(av, winMs){
-    var half=(winMs/1000)/2, out=[], i, start=0, end=0, sum=0, count;
-    for(i=0;i<av.length;i++){
-      while(start<end && av[start].t < av[i].t-half){ sum-=av[start].a; start++; }
-      while(end<av.length && av[end].t <= av[i].t+half){ sum+=av[end].a; end++; }
-      count=end-start;
-      out.push(count ? sum/count : av[i].a);
-    }
-    for(i=0;i<av.length;i++) av[i].a=out[i];
-  }
-
   function process(samps){
-    var recordT0 = samps[0].t;
-    // 기준 평균: 시작 직후 BASELINE_TRIM_MS(탭 진동)는 빼고, 나머지 기준 구간만 사용
-    var baseSamps = samps.filter(function(s){ var e=s.t-recordT0; return e>=BASELINE_TRIM_MS && e<BASELINE_MS; });
-    if(baseSamps.length < 5) baseSamps = samps.filter(function(s){ return s.t-recordT0 < BASELINE_MS; });
-    var base = computeBaseline(baseSamps.length ? baseSamps : samps.slice(0,10));
-    var rideSamps = samps.filter(function(s){ return s.t-recordT0 >= BASELINE_MS; });
-    if(rideSamps.length < 2) rideSamps = samps.slice(Math.max(0, samps.length-2));
-    var rideT0 = rideSamps[0].t;
-    var av = rideSamps.map(function(s){ return { t:(s.t-rideT0)/1000, a:vertAccel(base,s) }; });
-    smooth(av, SMOOTH_MS);
-
-    // ── 구간 인지 드리프트 보정 v2 — 운행 구간 탐색 ─────────────────────────────
-    // |스무딩 가속도| > A_MOVE_DET가 MOVE_SUSTAIN_S 이상 '지속'되는 블록만 운행으로 인정.
-    // 문 개폐 쾅·발걸음 같은 짧은 스파이크(스무딩 후에도 0.15를 잠깐 넘을 수 있음)가
-    // 운행 경계를 오염시키지 않게 하기 위함. iA=첫 블록 시작, iB=마지막 블록 끝.
-    var N = av.length, i, dt;
-    var A_MOVE_DET = 0.15, MOVE_SUSTAIN_S = 0.5;
-    var iA = -1, iB = -1, runStart = -1;
-    for(i=0;i<N;i++){
-      if(Math.abs(av[i].a) > A_MOVE_DET){
-        if(runStart < 0) runStart = i;
-      } else if(runStart >= 0){
-        if(av[i-1].t - av[runStart].t >= MOVE_SUSTAIN_S){ if(iA < 0) iA = runStart; iB = i-1; }
-        runStart = -1;
-      }
-    }
-    if(runStart >= 0 && av[N-1].t - av[runStart].t >= MOVE_SUSTAIN_S){ if(iA < 0) iA = runStart; iB = N-1; }
-
-    var vel = [{t:av[0].t, v:0}], v=0;
-    // 적분은 데드존 없는 원신호(스무딩만)로 → 가속·감속 램프 꼬리가 안 깎여 과소추정 감소.
-    // 데드존(dz)은 정지 클램프 판정에만 별도로 사용.
-    var aPrev = av[0].a;
-    var dz = [Math.abs(av[0].a) < ACC_GATE ? 0 : av[0].a];
-    for(i=1;i<av.length;i++){
-      var a = av[i].a;                                       // 원신호로 적분
-      dt = Math.min(av[i].t - av[i-1].t, DT_CAP);            // dt 상한(신호 끊김 시 폭주 방지)
-      v += (a + aPrev)/2 * dt;
-      vel.push({t:av[i].t, v:v});
-      dz.push(Math.abs(av[i].a) < ACC_GATE ? 0 : av[i].a);  // 데드존은 판정용
-      aPrev = a;
-    }
-    // ── 구간 보정 v2: '속도' 영역 앵커로 휴지/운행 바이어스를 구간별 제거 ─────────
-    // vPre  = 출발 직전 1초의 평균 속도(그때까지 누적된 휴지 드리프트),
-    // vPost = 기록 끝 직전 1초의 평균 속도(자동종료 조건상 마지막 3초는 확실한 정지 →
-    //         문 개폐 진동·재착상 크리프는 이 슬라이스 밖에 있음).
-    // [시작..출발] 0→vPre, [출발..도착] vPre→vPost 램프, 도착 후 vPost 상수를 빼면
-    // 휴지 바이어스와 '운행 중에만 존재한' 바이어스가 각자의 구간에서 제거된다.
-    // 속도 앵커는 가속도 평균보다 강건: 문 진동·발걸음은 적분하면 ≈0이라 앵커를 못 흔든다.
-    // 추정 바이어스가 비정상(레일 초과)이거나 도착 정지 데이터가 부족하면 전구간 선형으로 폴백.
-    var tS = vel[0].t, tE = vel[vel.length-1].t;
-    var span = (tE - tS) || 1, vEnd, segOK = false;
-    var moveBias = null;   // 운행 구간 바이어스율(m/s², 부호 포함) — 다음 런 피드포워드용
-    if(iA >= 0 && iB > iA){
-      var tA = av[iA].t, tB = av[iB].t;
-      var pS=0, pC=0, pT=0, qS=0, qC=0, qT=0;
-      for(i=0;i<vel.length;i++){
-        var ta = vel[i].t;
-        if(ta >= tA-1.4 && ta <= tA-0.4){ pS += vel[i].v; pC++; pT += ta; }
-        if(ta >= tE-1.5 && ta <= tE-0.1){ qS += vel[i].v; qC++; qT += ta; }
-      }
-      var vPre = (pC >= 10) ? pS/pC : 0;   // 출발 전 구간이 짧으면 0(기준 측정 직후라 드리프트 ≈ 0)
-      var tPc  = (pC >= 10) ? pT/pC : tS;  // 앵커 슬라이스의 실제 시간 중심
-      var vPost = qC ? qS/qC : vel[vel.length-1].v;
-      var tQc   = qC ? qT/qC : tE;
-      // 바이어스 분해 — 두 모드:
-      //  · 출발 전 대기가 길면(앵커 ≥1초 + 지렛대 ≥2.5초): 휴지 바이어스율(bRest)을 추정해 전 구간에서
-      //    빼고, 두 앵커 사이 누적의 초과분(extra)만 운행 구간에 배분 → 상수 바이어스가 정속 구간에
-      //    인공 기울기를 남기지 않는다(긴 대기에서 v32가 남기던 ~2 m/min 잔재 제거).
-      //  · 대기가 짧으면: bRest 외삽은 분모가 작아 문닫힘 진동 등의 vPre 오염을 크게 증폭하므로 쓰지 않고,
-      //    검증된 v32 배분(출발 전 램프 0→vPre, 운행 램프 vPre→vPost)을 그대로 사용 — 짧은 대기에선
-      //    휴지 누적 자체가 미미해서 이 방식이 정확하다.
-      var preSpan = Math.max(tA - tS, 0.001), movSpan = Math.max(tB - tA, 0.2);
-      var longPre = (pC >= 50) && (tPc - tS) >= 2.5;
-      var bRest = longPre ? vPre/(tPc - tS) : 0;
-      var extra = longPre ? (vPost - vPre) - bRest*(tQc - tPc) : (vPost - vPre);
-      var preRate = longPre ? bRest : vPre/preSpan;
-      var movRate = longPre ? (bRest + extra/movSpan) : extra/movSpan;
-      var postStill = (tE - tB) >= 2.0;    // 도착 후 정지 데이터 충분(운행 중 수동 종료 배제)
-      if(postStill && Math.abs(preRate) < 0.15 && Math.abs(movRate) < 0.25){
-        for(i=0;i<vel.length;i++){
-          var tt = vel[i].t;
-          var Lb = longPre ? bRest*(tt - tS) : vPre*Math.min((tt - tS)/preSpan, 1);
-          var Lr = (tt <= tA) ? 0 : ((tt < tB) ? extra*(tt - tA)/movSpan : extra);
-          vel[i].v -= Lb + Lr;
-        }
-        vEnd = vPost - vPre;               // 운행 구간 드리프트(안정도 보고용)
-        moveBias = extra/movSpan;          // 운행 중 '추가' 바이어스 실측치(라이브 피드포워드용)
-        segOK = true;
-      }
-    }
-    if(!segOK){
-      // 폴백: 잔류 바이어스 보정(출발·도착 v=0 → 끝값을 0으로 선형 보정)
-      vEnd = vel[vel.length-1].v;
-      for(i=0;i<vel.length;i++) vel[i].v -= vEnd * (vel[i].t - tS)/span;
-    }
-    // 정지 클램프: 무가속 & 최저속도 미만이면 0 (드리프트 잔재 제거)
-    for(i=0;i<vel.length;i++){ if(dz[i] === 0 && Math.abs(vel[i].v) < V_FLOOR) vel[i].v = 0; }
-
-    var absV = vel.map(function(p){ return Math.abs(p.v); });
-    var maxV = Math.max.apply(null, absV.concat([0]));
-    // 정속 = 가속이 끝난(|가속도|<ACC_CRUISE) + 속도가 충분히 높은(>0.5*최고) 구간만 사용.
-    // (옛 방식은 최고속도의 80% 이상을 전부 써서 가감속 램프 윗부분이 섞여 과소추정됨)
-    var cs=-1, ce=-1, plateau=[], platT=[];
-    for(i=0;i<vel.length;i++){
-      if(Math.abs(av[i].a) < ACC_CRUISE && absV[i] >= 0.5*maxV){ if(cs<0)cs=i; ce=i; plateau.push(absV[i]); platT.push(vel[i].t); }
-    }
-    var platPrimary = plateau.length > 0;
-    if(!plateau.length){   // 평탄 구간을 못 찾으면 옛 방식(0.8*최고)으로 폴백
-      for(i=0;i<vel.length;i++){ if(absV[i] >= PLATEAU_FRAC*maxV) plateau.push(absV[i]); }
-      cs=0; ce=vel.length-1;
-    }
-    var cruise = median(plateau);
-
-    // ── 바이어스 변동 검사: 보정 '후' 정속 구간의 기울기 ─────────────────────────
-    // 정속 중 실제 가속도는 0이므로 보정 후 정속 곡선은 평평해야 한다. 상수 바이어스는
-    // 위 구간 보정이 전부 흡수하므로, 남은 기울기 = 선형 모델 밖의 성분
-    // = 측정 도중 '변한' 바이어스(워밍업·열 드리프트 등) 또는 실제 속도 변동의 증상.
-    // cruiseSlope = 정속 구간을 가로지르는 추세선 변화량(m/s). null = 검사 불가.
-    var cruiseSlope = null;
-    if(platPrimary && plateau.length >= 30){
-      var spanP = platT[platT.length-1] - platT[0];
-      if(spanP >= 3.0){
-        var n2 = plateau.length, mt = 0, mv2 = 0;
-        for(i=0;i<n2;i++){ mt += platT[i]; mv2 += plateau[i]; }
-        mt /= n2; mv2 /= n2;
-        var sxx = 0, sxy = 0;
-        for(i=0;i<n2;i++){ var dtp = platT[i]-mt; sxx += dtp*dtp; sxy += dtp*(plateau[i]-mv2); }
-        if(sxx > 0){
-          var beta = sxy/sxx, sse = 0;
-          for(i=0;i<n2;i++){ var rr = plateau[i]-mv2-beta*(platT[i]-mt); sse += rr*rr; }
-          // 기울기 표준오차 — 스무딩·적분에 의한 자기상관을 0.3s당 독립표본 1개로 보수적 환산
-          var seB = Math.sqrt(Math.max(sse/Math.max(n2-2,1), 1e-12)/sxx) * Math.sqrt(Math.max(1, n2/(spanP/0.3)));
-          var dV = beta*spanP;
-          cruiseSlope = (Math.abs(dV) > 3*seB*spanP) ? dV : 0;   // 노이즈 수준이면 0(평평 판정)
-        }
-      }
-    }
-
-    var disp=0;
-    for(i=1;i<vel.length;i++){
-      dt = vel[i].t - vel[i-1].t;
-      disp += (vel[i].v + vel[i-1].v)/2 * dt;          // 부호 있는 변위 적분
-    }
-    var dist=Math.abs(disp);                            // 원점→도착 순이동(상승·하강 상쇄, 항상 양수)
-    // 운행시간: 실제 움직인 구간(첫 이동~정지 직전)만 — 끝의 정지 대기 3초가 포함되지 않게
-    var mvFirst=-1, mvLast=-1;
-    for(i=0;i<vel.length;i++){ if(absV[i] > STILL_V){ if(mvFirst<0) mvFirst=i; mvLast=i; } }
-    var fullSpan = tE - tS;
-    var moveDur = (mvFirst>=0 && mvLast>mvFirst) ? (vel[mvLast].t - vel[mvFirst].t) : fullSpan;
-    // 자세 변화 점검: 운행 끝 1.5초(자동종료면 정지 구간)의 중력 방향 vs 기준 방향 각도.
-    // 수직 가감속은 중력과 같은 축이라 평균 벡터의 '방향'을 거의 안 바꾸므로, 각도 변화 ≈ 실제 기기 회전.
-    var tiltDeg = null, lastT = rideSamps[rideSamps.length-1].t;
-    var tailSamps = rideSamps.filter(function(s){ return lastT - s.t <= 1500; });
-    if(tailSamps.length > 10){
-      var eb = computeBaseline(tailSamps);
-      var edot = Math.min(1, Math.max(-1, base.gh.x*eb.gh.x + base.gh.y*eb.gh.y + base.gh.z*eb.gh.z));
-      tiltDeg = Math.acos(edot)*180/Math.PI;
-    }
-    return { cruise:cruise, maxV:maxV, dist:dist, duration:moveDur, fullSpan:fullSpan, vel:vel, cruiseStart:cs, cruiseEnd:ce, gmag:base.gmag, n:rideSamps.length, endDrift:Math.abs(vEnd), sensor:activeSensor, tiltDeg:tiltDeg, scaleK:base.k, cruiseSlope:cruiseSlope, moveBias:moveBias };
+    return ElevatorMeasurement.analyze(samps,{baselineEnd:rideStartT,sensor:activeSensor});
   }
 
   // 출발 감지 순간 보정: 완만한 출발 램프에서는 (1) 바이어스 EMA가 초기 가속 일부를 흡수하고
@@ -442,7 +230,12 @@
 
   function recordSample(x, y, z, t){
     if(!recording) return;
-    if(x == null || y == null || z == null) return;
+    if(![x,y,z,t].every(Number.isFinite)) return;
+    if(samples.length){
+      var previous=samples[samples.length-1];
+      if(t<=previous.t) return;
+      if(t-previous.t>200){ cancelMeasurement("센서 데이터가 끊겨 측정을 취소했습니다. 화면을 켜고 다시 시도하세요."); return; }
+    }
     var s = { t:t, x:x, y:y, z:z };
     samples.push(s);
     if(samples.length === 1) recordStart = t;  // 센서 기동이 늦어도(폴백 등) 기준 3초를 첫 샘플부터 온전히 확보
@@ -459,11 +252,18 @@
       if(elapsed >= BASELINE_TRIM_MS) baselineSamples.push(s);   // 시작 직후 탭 진동 제외
       if(elapsed >= BASELINE_MS){
         baseline = computeBaseline(baselineSamples.length ? baselineSamples : samples);
-        sigmaBase = baselineSigma(baseline, baselineSamples.length ? baselineSamples : samples);
+        var vectorMotion=baselineSamples.some(function(p){
+          var dot=(p.x*baseline.gh.x+p.y*baseline.gh.y+p.z*baseline.gh.z)/Math.hypot(p.x,p.y,p.z);
+          return dot<Math.cos(2*Math.PI/180);
+        });
+        if(baselineSamples.length<25 || baselineSigma(baseline,baselineSamples)>0.12 || vectorMotion){
+          recordStart=t; samples=[s]; baselineSamples=[]; baseMag=mag; return;
+        }
+        if(baseline.gmag<9.3 || baseline.gmag>10.3){cancelMeasurement("중력 센서 값이 비정상입니다. 기기와 브라우저를 확인하세요.");return;}
         phase = "ride"; rideStartT = t;
         vDet = 0; biasA = 0; lastDetT = t; aDetPrev = 0;
         hasMoved = false; stillSince = null; stillWindow = [];
-        moveAccSince = null; quietSince = null; detBuf = [];
+        moveAccSince = null; detBuf = [];
         $("countdown").style.display = "none";
         $("liveWrap").style.display = "block";
         $("status").innerHTML = "<b>지금 엘리베이터를 운행하세요</b> — 멈추면 <b>자동 종료</b>됩니다";
@@ -490,14 +290,14 @@
       var quiet = ready && wSd < QUIET_SD && Math.abs(wMean - biasA) < QUIET_MEAN;
 
       // 온라인 바이어스 보정: 조용하고 윈도평균이 현재 바이어스와 가까울 때만(램프 배제)
-      if(quiet && Math.abs(wMean - biasA) < BIAS_GATE){
+      if(!hasMoved && quiet && Math.abs(wMean - biasA) < BIAS_GATE){
         var alpha = Math.min(1, dt / BIAS_TAU);
         biasA += alpha * (wMean - biasA);
       }
       // ZUPT: 조용함 + '지금' 가속도도 작을 때만 0 고정.
       // 윈도 평균(quiet)은 ~0.4s 지연되므로, 완만한 가감속이 ±STILL_V 대역을 지나는 순간을
       // 순간 가속도(aCorr)로 걸러내지 않으면 통과 중에 속도가 깎여 라이브 추정이 손실된다.
-      if(quiet && Math.abs(aCorr) < QUIET_MEAN && Math.abs(vDet) < STILL_V) vDet = 0;
+      if(!hasMoved && quiet && Math.abs(aCorr) < QUIET_MEAN && Math.abs(vDet) < STILL_V) vDet = 0;
 
       // 되감기 버퍼(출발 전까지만): 출발 감지 시 바이어스·속도 재구성에 사용
       if(!hasMoved){
@@ -514,60 +314,22 @@
       } else moveAccSince = null;
       if(hasMoved && !wasMoved){                // 출발 순간: 흡수된 바이어스·깎인 속도 복원
         rewindBias();
-        // 되돌림 보정 준비 — 기준점은 되감기 '후'의 휴지 바이어스.
-        // depT: 진동은 운행과 함께 시작되는데 감지가 ~0.7s 늦으므로 그만큼 당겨 잡는다.
-        b0Dep = biasA;
-        depT = Math.max(rideStartT, t - 700);
-        biasInt = 0; retroDone = false;
-        rQuietSince = null; rWSum = 0; rWCnt = 0;
-        // 피드포워드: 직전 런이 실측한 운행 바이어스를 선주입 → 램프 구간부터 정확.
-        // (retro의 Δ̂ 정의가 b0Dep 기준이라 주입분은 biasInt로 자동 상쇄되어 수학적으로 일관)
-        if(lastMoveBias !== null) biasA += lastMoveBias;
+        rideDirection=Math.sign(vDet)||Math.sign(aCorr);
       }
-
-      // 폴백(레스큐): 장시간 '엄격 조용'이면 고착/틸트로 보고 vDet·바이어스 재설정
-      var strictSd = Math.max(2.0*sigmaBase, 0.03);
-      if(ready && wSd < strictSd){
-        if(quietSince === null) quietSince = t;
-        else {
-          var qd = t - quietSince;
-          if(hasMoved && ((qd >= RESCUE_QUIET_MS && Math.abs(vDet) < RESCUE_V) || (qd >= RESCUE_HARD_MS && Math.abs(vDet) < RESCUE_HARD_V))){
-            vDet = 0; biasA = wMean; quietSince = t;   // 0으로 재설정 후 정상 3초 확정에 맡김
-          }
-        }
-      } else quietSince = null;
-
-      // 되돌림 보정(런당 1회): 정속 진입 후 quiet가 RETRO_QUIET_MS 지속되면,
-      // quiet 구간 wMean 평균(EMA 지연 없음)으로 Δ̂ = 운행 중 바이어스 변화를 실측하고
-      // 출발 이후 쌓인 속도 오차 [Δ̂×경과 − 이미 차감된 양(biasInt)]을 vDet에서 한 번에 제거.
-      if(hasMoved && !retroDone){
-        biasInt += (biasA - b0Dep) * dt;
-        if(quiet){
-          if(rQuietSince === null){ rQuietSince = t; rWSum = 0; rWCnt = 0; }
-          else if(t - rQuietSince > 500){ rWSum += wMean; rWCnt++; }   // 첫 0.5s는 윈도 잔류 램프 배제
-          if(t - rQuietSince >= RETRO_QUIET_MS && rWCnt > 10 && Math.abs(vDet) > RETRO_MIN_V){
-            var dHat = rWSum/rWCnt - b0Dep;
-            if(Math.abs(dHat) < FF_BIAS_CAP){
-              var corr = dHat * (t - depT)/1000 - biasInt;
-              vDet -= corr;
-              liveAdj = corr; liveAdjT = t;        // 표시는 0.5s에 걸쳐 새 값으로 수렴
-              biasA = b0Dep + dHat;                // EMA도 실측값으로 점프(이후 오차 누적 차단)
-            }
-            retroDone = true;                      // 레일 초과여도 재시도 없음(런당 1회)
-          }
-        } else { rQuietSince = null; rWSum = 0; rWCnt = 0; }
-      }
+      // Low acceleration cannot distinguish cruising from rest. Require an opposite braking phase.
+      if(hasMoved && aCorr*rideDirection < -0.08){
+        if(brakeSince===null) brakeSince=t;
+        if(t-brakeSince>=350) brakingSeen=true;
+      } else brakeSince=null;
 
       // 라이브 표시 버퍼(표시 전용 — 검출 로직에는 영향 없음)
       liveAEma += 0.25 * (aCorr - liveAEma);                  // 표시용 가속도 살짝 평활(~60ms)
       var vDisp = vDet;
-      if(liveAdj && t > liveAdjT && t - liveAdjT < 500)
-        vDisp += liveAdj * (1 - (t - liveAdjT)/500);          // 되돌림 점프 이징
       liveBuf.push({ t:t, a:liveAEma, v:vDisp });
       while(liveBuf.length && t - liveBuf[0].t > LIVE_SPAN_MS) liveBuf.shift();
       if(hasMoved && Math.abs(vDet) > liveMaxV) liveMaxV = Math.abs(vDet);
 
-      var stationary = quiet && Math.abs(vDet) < STILL_V;
+      var stationary = brakingSeen && quiet && Math.abs(vDet) < STILL_V;
       if(hasMoved && stationary){
         if(stillSince === null) stillSince = t;
         else if(t - stillSince >= STOP_HOLD_MS){ finishMeasurement(true); return; }
@@ -621,6 +383,7 @@
         motionSensor.addEventListener("error", function(){
           if(!recording || activeSensor === "devicemotion") return;
           if(motionSensor){ try { motionSensor.stop(); } catch(err) {} motionSensor = null; }
+          if(samples.length){cancelMeasurement("측정 중 센서가 중단되었습니다. 다시 측정하세요.");return;}
           startDeviceMotion();
         });
         motionSensor.start();
@@ -640,6 +403,10 @@
   function uiTick(){
     if(!recording) return;
     var now = performance.now();
+    if((!samples.length && now-recordStart>5000) || (samples.length && now-samples[samples.length-1].t>1500)){
+      cancelMeasurement("센서 응답이 없습니다. 권한과 기기 지원 여부를 확인하세요."); return;
+    }
+    if(now-recordStart>600000){cancelMeasurement("10분 제한에 도달했습니다. 한 번의 운행만 측정하세요.");return;}
     var elapsed = now - recordStart;
     if(phase === "baseline"){
       var left = Math.ceil((BASELINE_MS - elapsed)/1000);
@@ -659,8 +426,8 @@
   }
 
   // ── 라이브 그래프(표시 전용) ──────────────────────────────────────────────
-  // 가속도는 적분이 없어 드리프트가 없는 신뢰 가능한 신호이고,
-  // 속도는 라이브 채널(감도보정+온라인 바이어스+ZUPT) 추정치 = 참고용.
+  // 가속도에도 센서 영점·자세 오차가 포함될 수 있으며,
+  // 속도는 라이브 채널(출발 전 바이어스 보정 + 적분) 추정치 = 참고용.
   function liveLoop(ts){
     if(!(recording && phase === "ride")){ liveRaf = null; return; }
     drawLive(typeof ts === "number" ? ts : performance.now());
@@ -720,18 +487,19 @@
   function requestWakeLock(){
     if(!("wakeLock" in navigator)) return;
     try {
-      navigator.wakeLock.request("screen").then(function(wl){ wakeLock = wl; }).catch(function(){});
+      navigator.wakeLock.request("screen").then(function(wl){ if(recording) wakeLock = wl; else wl.release(); }).catch(function(){});
     } catch(e) {}
   }
   function releaseWakeLock(){
     if(wakeLock){ try { wakeLock.release(); } catch(e) {} wakeLock = null; }
   }
   document.addEventListener("visibilitychange", function(){
-    if(recording && document.visibilityState === "visible") requestWakeLock();
+    if(recording && document.visibilityState === "hidden") cancelMeasurement("화면이 숨겨져 측정을 취소했습니다. 측정 중 앱을 화면에 유지하세요.");
   });
 
   function cancelMeasurement(msg){
     if(!recording) return;
+    rememberCapture(msg || "cancelled");
     recording = false; phase = "idle";
     stopMotionSensor(); releaseWakeLock();
     if(ticker){ clearInterval(ticker); ticker = null; }
@@ -742,15 +510,18 @@
   }
 
   function start(){
+    if(starting || recording) return;
+    starting=true; btn.disabled=true;
     function begin(){
+      starting=false; btn.disabled=false;
+      rideDirection=0; brakeSince=null; brakingSeen=false;
       recording = true; phase = "baseline";
       samples = []; baselineSamples = []; baseline = null;
       vDet = 0; biasA = 0; lastDetT = null; aDetPrev = 0;
-      moveAccSince = null; quietSince = null; sigmaBase = 0.03; detBuf = [];
+      moveAccSince = null; detBuf = [];
       recordStart = performance.now(); rideStartT = 0;
       baseMag = null; stillSince = null; hasMoved = false; stillWindow = [];
       liveBuf = []; liveMaxV = 0; liveAEma = 0; liveLastTxt = 0;
-      retroDone = true; rQuietSince = null; liveAdj = 0; liveAdjT = 0;   // 되돌림 상태 초기화(lastMoveBias는 세션 유지)
       requestWakeLock();
       $("results").classList.remove("show");
       $("liveWrap").style.display = "none";
@@ -764,8 +535,8 @@
        typeof DeviceMotionEvent.requestPermission === "function"){
       DeviceMotionEvent.requestPermission().then(function(res){
         if(res === "granted") begin();
-        else alert("센서 권한이 거부되었습니다.");
-      }).catch(function(){ begin(); });
+        else {starting=false;btn.disabled=false;alert("센서 권한이 거부되었습니다.");}
+      }).catch(function(){ starting=false;btn.disabled=false;alert("센서 권한 요청에 실패했습니다. HTTPS 주소와 브라우저 설정을 확인하세요."); });
     } else {
       begin();
     }
@@ -783,16 +554,18 @@
     $("liveWrap").style.display = "none";
 
     if(samples.length < 10 || (samples[samples.length-1].t - recordStart) < BASELINE_MS + 1000){
+      rememberCapture("SHORT");
       $("status").innerHTML = "측정 시간이 너무 짧습니다. 다시 시도하세요 (기준 3초 + 운행 필요).";
       return;
     }
-    var r = process(samples);
-    // 피드포워드: 이번 런이 실측한 운행 바이어스를 다음 런 출발 시 선주입(세션 한정).
-    // 정속 기울어짐(바이어스 변동) 경고가 뜬 런의 값은 신뢰할 수 없으므로 갱신하지 않는다.
-    if(r && r.moveBias != null && isFinite(r.moveBias) && Math.abs(r.moveBias) < FF_BIAS_CAP){
-      var sOK = !(r.cruiseSlope != null && r.cruise > 0 && Math.abs(r.cruiseSlope)/Math.max(r.cruise,0.1) >= 0.035);
-      if(sOK) lastMoveBias = r.moveBias;
+    var r;
+    try { r=process(samples); }
+    catch(error){
+      rememberCapture(error.code||error.message);
+      $("results").classList.remove("show");
+      $("status").textContent=error.message; return;
     }
+    rememberCapture("complete",r);
     showResults(r);
     pushHistory(r);
     $("status").innerHTML = auto ? "정지 감지 — <b>자동 종료</b>되었습니다. 결과를 확인하세요."
@@ -804,40 +577,23 @@
   });
 
   function showResults(r){
-    $("cruiseMpm").textContent = (r.cruise*60).toFixed(1);
-    $("cruiseMs").textContent = r.cruise.toFixed(3);
+    $("cruiseMpm").textContent = r.cruise == null ? "–" : (r.cruise*60).toFixed(1);
+    $("cruiseMs").textContent = r.cruise == null ? "–" : r.cruise.toFixed(2);
     $("maxMpm").textContent = (r.maxV*60).toFixed(1) + " m/min";
     $("dist").textContent = r.dist.toFixed(2) + " m";
     $("dur").textContent = r.duration.toFixed(1) + " s";
-    var sensorLabel = r.sensor === "accelerometer" ? "고속" : "기본";
-    $("rate").textContent = (r.n / (r.fullSpan || r.duration || 1)).toFixed(0) + " Hz · " + sensorLabel;
-    var gOk = r.gmag > 9.5 && r.gmag < 10.1;
+    var sensorLabel = r.sensor === "accelerometer" ? "직접 센서" : "기본 센서";
+    $("rate").textContent = (r.sampleHz || (r.n-1) / (r.fullSpan || r.duration || 1)).toFixed(0) + " Hz · " + sensorLabel;
+    var gOk = r.gmag >= 9.3 && r.gmag <= 10.3;
     var gTxt = r.gmag.toFixed(2) + " m/s²";
-    if(r.scaleK != null && gOk) gTxt += " <span style='font-size:12px;color:var(--muted)'>·×" + r.scaleK.toFixed(3) + "</span>";
+    if(r.scaleK != null && r.scaleK !== 1 && gOk) gTxt += " <span style='font-size:12px;color:var(--muted)'>·×" + r.scaleK.toFixed(3) + "</span>";
     $("gmag").innerHTML = gTxt;
     $("gmag").classList.toggle("err", !gOk);
 
-    var warns = [];
-    if(r.tiltDeg != null && r.tiltDeg >= 2)
-      warns.push("⚠ 기기 자세 변화 " + r.tiltDeg.toFixed(1) + "° — 측정 중 기기가 움직였을 수 있어 신뢰도가 낮습니다");
-    if(!gOk)
-      warns.push("⚠ 기준 중력 비정상 — 기준 측정 오염 또는 센서 이상 의심 (감도 보정 미적용)");
-    var slopeRatio = 0;
-    if(r.cruiseSlope != null && r.cruise > 0){
-      slopeRatio = Math.abs(r.cruiseSlope)/Math.max(r.cruise, 0.1);
-      if(slopeRatio >= 0.035)
-        warns.push("⚠ 정속 구간 기울어짐 Δ" + (Math.abs(r.cruiseSlope)*60).toFixed(1) +
-          " m/min — 측정 중 바이어스 변동(거치 직후 워밍업 등) 또는 실제 속도 변동 의심. 재측정 권장:" +
-          " 재측정에서 사라지면 센서, 반복되면 설비 쪽입니다");
-    }
-    var warnHtml = warns.length ? "<br><span style='color:var(--danger)'>" + warns.join("<br>") + "</span>" : "";
-    if(r.endDrift != null && r.cruise > 0){
-      var ratio = r.endDrift/Math.max(r.cruise,0.1);
-      var q = ratio < 0.15 ? "높음" : (ratio < 0.4 ? "보통" : "낮음");
-      if(slopeRatio >= 0.06) q = "낮음";                            // 정속 기울어짐이 크면 강등
-      else if(slopeRatio >= 0.035) q = (q === "높음") ? "보통" : "낮음";
-      $("qualTag").innerHTML = "측정 안정도: <b>"+q+"</b> (드리프트 "+(r.endDrift*60).toFixed(1)+" m/min)" + warnHtml;
-    } else { $("qualTag").innerHTML = "측정 안정도: –" + warnHtml; }
+    var warns=(r.warnings||[]).slice();
+    if(!r.version) warns.push("이전 계산 방식의 기록입니다. 새 방식의 품질 검사를 받지 않았습니다.");
+    $("qualTag").textContent=(warns.length ? "품질 확인 필요: "+warns.join(" · ") : "신호 품질 검사 통과 · 절대 정확도는 별도 검증 필요")+
+      (r.endDrift!=null?" · 누적 보정 "+(r.endDrift*60).toFixed(1)+" m/min":"");
     $("results").classList.add("show");
     drawChart(r);
   }
@@ -872,6 +628,7 @@
     var cum=[0]; for(i=1;i<vel.length;i++){ var dt=vel[i].t-vel[i-1].t; cum.push(cum[i-1]+(vel[i].v+vel[i-1].v)/2*dt); } c.cum=cum;   // 부호 있는 누적 변위(구간거리=두 점 순이동)
     c.cruiseStart = (csIdx>=0 ? csIdx : 0);
     c.cruiseEnd = (ceIdx>=0 ? ceIdx : vel.length-1);
+    c.hasCruise = csIdx >= 0 && ceIdx >= csIdx;
     c.view={t0:0,t1:c.tMax}; c.cursor=null; c.measure=[];
   }
   function phaseLine(ctx,i0,i1,color){
@@ -914,9 +671,11 @@
       ctx.fillStyle="#8b949e"; ctx.textAlign="center"; ctx.fillText(xt[i].toFixed(1), xx, R.y+R.h+15);
     }
     ctx.save(); ctx.beginPath(); ctx.rect(R.x,R.y,R.w,R.h); ctx.clip();
-    phaseLine(ctx,0,c.cruiseStart,"#f0c674");
-    phaseLine(ctx,c.cruiseStart,c.cruiseEnd,"#36d399");
-    phaseLine(ctx,c.cruiseEnd,c.vel.length-1,"#6aa3ff");
+    if(c.hasCruise){
+      phaseLine(ctx,0,c.cruiseStart,"#f0c674");
+      phaseLine(ctx,c.cruiseStart,c.cruiseEnd,"#36d399");
+      phaseLine(ctx,c.cruiseEnd,c.vel.length-1,"#6aa3ff");
+    } else phaseLine(ctx,0,c.vel.length-1,"#f0c674");
     if(c.precision) drawMeasure(ctx,R); else if(c.cursor!=null) drawCursor(ctx,R);
     ctx.restore();
     ctx.strokeStyle="#2b323f"; ctx.lineWidth=1; ctx.beginPath();
@@ -1023,6 +782,7 @@
     var hhmm = ("0"+d.getHours()).slice(-2)+":"+("0"+d.getMinutes()).slice(-2)+":"+("0"+d.getSeconds()).slice(-2);
     history.push({
       id: Date.now()+"_"+Math.floor(Math.random()*1e6), time:hhmm,
+      version:r.version, warnings:r.warnings, sampleHz:r.sampleHz, maxGapMs:r.maxGapMs, baselineSigma:r.baselineSigma,
       cruise:r.cruise, maxV:r.maxV, dist:r.dist, duration:r.duration, fullSpan:r.fullSpan,
       gmag:r.gmag, n:r.n, cruiseStart:r.cruiseStart, cruiseEnd:r.cruiseEnd, endDrift:r.endDrift, sensor:r.sensor,
       tiltDeg:(r.tiltDeg == null ? null : +r.tiltDeg.toFixed(2)), scaleK:(r.scaleK == null ? null : +r.scaleK.toFixed(4)),
@@ -1036,7 +796,7 @@
     if(!history.length){ $("histCard").style.display = "none"; return; }
     $("histCard").style.display = "block";
     var rows = history.slice().reverse().map(function(h){   // 최신 기록이 맨 위로
-      return "<tr data-id='"+h.id+"' style='cursor:pointer'><td>"+h.time+"</td><td>"+(h.cruise).toFixed(4)+
+      return "<tr data-id='"+h.id+"' style='cursor:pointer'><td>"+h.time+"</td><td>"+(h.cruise == null ? "–" : h.cruise.toFixed(2))+
              "</td><td>"+h.dist.toFixed(2)+"</td><td>"+h.duration.toFixed(1)+
              "</td><td style='text-align:center'><button class='del' data-id='"+h.id+"' style='background:none;border:none;color:var(--danger);font-size:16px;line-height:1;padding:2px 6px'>✕</button></td></tr>";
     }).join("");
