@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
-<title>엘리베이터 속도 측정기</title>
+<title>엘리베이터 속도 · 승차감 측정기</title>
 <meta name="theme-color" content="#0e1116">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icon-192.png">
@@ -11,7 +11,7 @@
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<meta name="apple-mobile-web-app-title" content="엘베속도">
+<meta name="apple-mobile-web-app-title" content="엘베측정">
 <style>
   :root { --bg:#0e1116; --card:#1a1f29; --line:#2b323f; --txt:#e6edf3; --muted:#8b949e; --accent:#36d399; --danger:#f87272; }
   * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
@@ -62,16 +62,28 @@
   .topbar h1 { flex:1; margin:0; }
   button.topInstall { font-size:13px; font-weight:700; padding:9px 12px; border-radius:10px; border:1px solid var(--accent); background:transparent; color:var(--accent); white-space:nowrap; }
   .note { font-size:12px; color:var(--muted); line-height:1.5; }
+  [hidden] { display:none !important; }
+  .modebar { margin-bottom:14px; }
+  .modebar button { font-size:17px; padding:14px; }
+  .ride-field { display:block; font-size:14px; margin:12px 0; }
+  .ride-field input,.ride-field select { width:100%; margin-top:6px; padding:12px; background:#11151c; color:var(--txt); border:1px solid var(--line); border-radius:8px; font-size:16px; }
+  button:disabled { opacity:.45; }
+  #rideStatus,#saveStatus { white-space:pre-line; line-height:1.6; }
 </style>
 </head>
 <body>
   <div class="topbar">
-    <h1>엘리베이터 속도 측정기</h1>
+    <h1>엘리베이터 측정기</h1>
     <button id="installTop" class="topInstall">📲 홈 화면 추가</button>
   </div>
 
   <div id="banner" class="banner"></div>
+  <div class="row modebar" role="group" aria-label="측정 모드">
+    <button id="speedMode" class="sec active" aria-pressed="true">속도 측정</button>
+    <button id="rideMode" class="sec" aria-pressed="false">승차감 · 소음</button>
+  </div>
 
+  <div id="speedPanel">
   <div class="card">
     <div id="status" class="status">버튼을 누른 뒤 <b>3초간 정지 상태</b>를 유지하세요.</div>
     <div id="liveWrap" class="live" style="display:none">
@@ -141,6 +153,46 @@
     최초 1회 온라인 접속하면 이후 <b>오프라인</b>에서도 동작합니다.
   </div>
 
+  </div>
+  <section id="ridePanel" hidden>
+    <div class="card">
+      <b>승차감 · 소음 측정</b>
+      <p class="note">화면을 위로, 휴대폰 윗부분을 엘리베이터 전방으로 향하게 바닥에 수평 고정하세요. X는 좌우, Y는 앞뒤, Z는 위아래입니다. 마이크 구멍을 막지 마세요.</p>
+      <label class="ride-field">현장명<input id="rideSite" maxlength="80" placeholder="예: 기흥동부 101-1"></label>
+      <label class="ride-field">운행 방향<select id="rideDirection"><option value="up">상승</option><option value="dn">하강</option></select></label>
+      <p class="note">시작 후 3초 동안 정지 → 안내 후 운행 → 도착 후 3초 기다린 뒤 종료하세요. 속도 측정과 별도로 기록합니다.</p>
+      <div id="rideStatus" role="status">마이크와 가속도 센서를 함께 기록합니다.</div>
+      <div class="grid" style="margin:12px 0">
+        <div class="stat"><div class="k">기록 시간</div><div id="rideTime" class="v">0.0 s</div></div>
+        <div class="stat"><div class="k" id="soundUnit">소음 · 미보정</div><div id="soundLive" class="v">– dBFS</div></div>
+      </div>
+      <canvas id="rideChart" width="600" height="190" aria-label="최근 5초 X Y Z 가속도"></canvas>
+      <div class="note">X 파랑 · Y 주황 · Z 초록 · 정지 기준을 뺀 가속도(gal)</div>
+      <button id="rideStart" class="main" style="margin-top:14px">승차감 측정 시작</button>
+    </div>
+    <div class="card">
+      <b>마이크 소음 보정</b>
+      <p class="note">기준 소음계와 나란히 놓고 같은 소리를 측정하세요. 아래에 기준값을 입력하고 5초 보정합니다. 보정 전에는 상대 음량(dBFS)만 표시하며 ESV 저장은 보정 후 가능합니다. 비가중 소음이며 dBA와 같지 않습니다.</p>
+      <label class="ride-field">기준 소음계 값 (비가중 dB SPL)<input id="soundReference" type="number" min="20" max="120" step="0.1" placeholder="기준 계측기의 측정값"></label>
+      <button id="calibrateSound" class="sec">5초간 소음 보정</button>
+      <p id="calibrationStatus" class="note">보정값 없음 · 마이크나 기기를 바꾸면 다시 보정하세요.</p>
+    </div>
+    <div id="rideResult" class="card" hidden>
+      <b>측정 결과</b><div id="rideSummary" class="note" style="white-space:pre-line;margin-top:10px"></div>
+      <p class="note">가속도 RMS·최대 절댓값은 가감속을 포함한 기록 전체의 값이며 EL-Scan A95가 아닙니다. 낮은 측정 빈도를 256 Hz로 보간해도 놓친 진동은 복원되지 않습니다.</p>
+      <p class="note">ESV 시험 형식: 가속도 배율은 기존 파일과 대조했습니다. 소음 채널은 변환식이 미확인이라 회사 앱 표시값과 비교가 필요합니다. 현장명에 PHONE EXPERIMENTAL 표시가 들어갑니다.</p>
+      <button id="saveEsv" class="main" disabled>ESV 파일 저장</button>
+      <button id="saveRideRaw" class="sec" style="width:100%;margin-top:10px">최근 측정 원본 저장 (JSON)</button>
+    </div>
+    <div class="card">
+      <b>저장 폴더</b>
+      <p class="note">희망 위치: 창우의 S25 Edge → storage → ELScan<br>폴더 선택 창에서 실제 ELScan 폴더를 선택하세요. 브라우저가 전체 경로를 알려주지는 않습니다.</p>
+      <button id="chooseFolder" class="sec">ELScan 폴더 선택</button>
+      <button id="defaultDownload" class="sec">일반 다운로드 사용</button>
+      <p id="folderStatus" class="note">폴더 미선택 · 브라우저 다운로드 위치에 저장됩니다.</p>
+      <div id="saveStatus" class="note" role="status"></div>
+    </div>
+  </section>
 <script src="measurement.js"></script>
 <script>
 (function(){
@@ -157,6 +209,7 @@
   var IDLE_TIMEOUT_MS = 120000, LIVE_SPAN_MS = 12000;
 
   var recording = false, phase = "idle";
+  window.ElevatorSpeedBusy = function(){ return recording || starting; };
   var samples = [], baselineSamples = [], baseline = null;
   var recordStart = 0, rideStartT = 0, ticker = null, history = [];
   var stillSince = null, hasMoved = false, baseMag = null, stillWindow = [];
@@ -510,6 +563,7 @@
   }
 
   function start(){
+    if(window.ElevatorRideBusy && window.ElevatorRideBusy()) return;
     if(starting || recording) return;
     starting=true; btn.disabled=true;
     function begin(){
@@ -861,7 +915,7 @@ if ("serviceWorker" in navigator) {
       "<br>· <b>Chrome</b>: 우측 상단 ⋮ 메뉴 → <b>홈 화면에 추가</b>(또는 '앱 설치')" +
       "<br>· <b>삼성 인터넷</b>: ≡ 메뉴 → <b>현재 페이지 추가</b> → 홈 화면" +
       "<br>· <b>iPhone Safari</b>: 공유 버튼 → <b>홈 화면에 추가</b>" +
-      "<br>이미 설치했다면 홈 화면의 <b>엘베속도</b> 아이콘으로 실행하세요." +
+      "<br>이미 설치했다면 홈 화면의 <b>엘베측정</b> 아이콘으로 실행하세요." +
       " 설치 후 <b>한 번만 온라인으로 실행</b>해 두면 이후엔 오프라인에서도 열립니다." +
       " <span style='opacity:.75'>(이 안내를 누르면 닫힘)</span>";
     banner.classList.add("show");
@@ -878,5 +932,8 @@ if ("serviceWorker" in navigator) {
   });
 })();
 </script>
+<script src="esv-header.js"></script>
+<script src="ride-core.js"></script>
+<script src="ride.js"></script>
 </body>
 </html>

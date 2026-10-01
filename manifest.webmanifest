@@ -1,7 +1,7 @@
 {
-  "name": "엘리베이터 속도 측정기",
-  "short_name": "엘베속도",
-  "description": "가속도센서로 엘리베이터 운행 속도를 측정합니다.",
+  "name": "엘리베이터 속도 · 승차감 측정기",
+  "short_name": "엘베측정",
+  "description": "속도와 승차감·소음을 각각 측정하고 시험용 EL-Scan ESV를 저장합니다.",
   "lang": "ko",
   "start_url": "./",
   "scope": "./",

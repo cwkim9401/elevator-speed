@@ -1,8 +1,8 @@
 /* Keep HTML and its calculation engine in the same versioned offline bundle. */
 const CACHE_PREFIX = 'elevspeed-';
-const CACHE = `${CACHE_PREFIX}v35`;
+const CACHE = `${CACHE_PREFIX}v36`;
 const APP_SHELL = './index.html';
-const ASSETS = [APP_SHELL, './measurement.js', './manifest.webmanifest', './icon-192.png', './icon-512.png'];
+const ASSETS = [APP_SHELL, './measurement.js', './ride-core.js', './ride.js', './sound-worklet.js', './esv-header.js', './manifest.webmanifest', './icon-192.png', './icon-512.png'];
 
 self.addEventListener('install', event => {
   event.waitUntil(caches.open(CACHE)
